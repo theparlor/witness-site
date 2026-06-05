@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex, nofollow">
+<title>Witness — an append-only record of everything that actually happened</title>
+<meta name="description" content="Witness captures raw events verbatim from across the portfolio — sessions, agents, cron, MCP calls, hook fires. Two contradictory claims produce two events, never one merged event. The record is never destroyed.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,500;0,700;0,800;0,900;1,500;1,700&family=Spectral:ital,wght@0,300;0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --ground:#17120e; --ground-2:#211a13; --ground-3:#2b2219; --line:#3a2f23;
+    --molten:#E8772B; --molten-hot:#FF8C3A; --ember:#F2A24A;
+    --brass:#C9A45C; --brass-bright:#E3C688; --brass-dim:#9A7F4E;
+    --steel:#7E8A98; --steel-light:#AAB4C0; --steel-deep:#5B6573;
+    --bone:#ECE3D4; --bone-dim:#B3A890; --bone-faint:#85795F;
+    --maxw:960px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--ground);color:var(--bone);font-family:'Spectral',Georgia,serif;font-weight:400;line-height:1.65;
+    background-image:radial-gradient(ellipse 70% 45% at 50% -8%, rgba(232,119,43,0.10), transparent 62%);}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 28px}
+  a{color:var(--brass-bright);text-decoration:none}
+  a:hover{color:var(--ember)}
+  h1,h2,h3,.display{font-family:'Playfair Display',Georgia,serif}
+
+  .ptbanner{background:rgba(232,119,43,0.07);border-bottom:1px solid var(--line);padding:9px 24px;text-align:center;font-size:12.5px;color:var(--bone-dim)}
+  .ptbanner b{color:var(--molten);font-weight:700;font-family:'Spectral';text-transform:uppercase;letter-spacing:1px}
+
+  /* shared product-site nav: back to portfolio + behind the veil */
+  nav.top{position:sticky;top:0;z-index:30;background:rgba(23,18,14,0.9);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+  nav.top .wrap{display:flex;align-items:center;gap:18px;height:62px;flex-wrap:wrap;max-width:1100px}
+  .brand{display:flex;align-items:center;gap:9px;font-family:'Playfair Display';font-weight:700;font-size:18px;color:var(--bone)}
+  .brand .mark{color:var(--brass)}
+  .brand .sep{color:var(--bone-faint);font-weight:400}
+  .brand .pname{color:var(--brass-bright)}
+  nav.top .spacer{flex:1}
+  nav.top a.nl{color:var(--bone-dim);font-size:13.5px}
+  nav.top a.nl:hover{color:var(--bone)}
+  nav.top a.veil{color:var(--steel-light);border:1px solid var(--steel-deep);border-radius:20px;padding:6px 15px;font-size:13px}
+  nav.top a.veil:hover{color:var(--bone);border-color:var(--steel-light)}
+
+  header.hero{padding:78px 0 50px}
+  .eyebrow{font-size:12px;letter-spacing:3px;text-transform:uppercase;color:var(--brass);margin-bottom:22px;font-weight:600}
+  h1.title{font-size:clamp(38px,6vw,64px);font-weight:800;line-height:1.05;letter-spacing:-0.5px;color:var(--bone)}
+  h1.title em{font-style:italic;color:var(--molten);font-weight:700}
+  .lede{font-size:clamp(17px,2.1vw,21px);color:var(--bone-dim);max-width:60ch;margin-top:24px;font-weight:300}
+  .lede strong{color:var(--bone);font-weight:500}
+  .forge-rule{margin:38px 0 0;height:2px;background:linear-gradient(90deg,var(--molten-hot),var(--ember) 28%,var(--brass) 60%,var(--steel) 100%);border-radius:2px;opacity:.85}
+
+  section{padding:50px 0;border-top:1px solid var(--line)}
+  .kicker{font-size:12px;letter-spacing:3px;text-transform:uppercase;color:var(--brass);margin-bottom:14px;font-weight:600}
+  h2{font-size:clamp(26px,3.4vw,38px);font-weight:700;color:var(--bone);letter-spacing:-0.3px;line-height:1.14}
+  p.body{font-size:16.5px;color:var(--bone-dim);max-width:66ch;margin-top:18px;font-weight:300}
+  p.body strong{color:var(--bone);font-weight:500}
+  .pull{font-family:'Playfair Display';font-style:italic;font-size:clamp(20px,2.6vw,26px);color:var(--brass-bright);line-height:1.4;margin:30px 0;padding-left:22px;border-left:3px solid var(--molten)}
+
+  .steps{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:30px}
+  .step{background:var(--ground-2);border:1px solid var(--line);border-radius:10px;padding:22px}
+  .step .n{font-family:'Playfair Display';font-size:30px;font-weight:800;color:var(--molten);line-height:1}
+  .step h3{font-size:18px;font-weight:700;color:var(--bone);margin:10px 0 8px}
+  .step p{font-size:14px;color:var(--bone-dim);line-height:1.55;font-weight:300}
+
+  .law{background:linear-gradient(135deg,rgba(232,119,43,0.06),rgba(33,26,19,0.4));border:1px solid var(--brass-dim);border-radius:12px;padding:30px 32px;margin-top:30px}
+  .law .role{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--molten);font-weight:600}
+  .law h3{font-family:'Playfair Display';font-size:24px;color:var(--brass-bright);margin:8px 0 12px}
+  .law p{font-size:15px;color:var(--bone-dim);line-height:1.65;max-width:66ch;font-weight:300}
+  .law p strong{color:var(--bone);font-weight:500}
+
+  .two-ch{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:26px}
+  .ch{background:var(--ground-2);border:1px solid var(--line);border-radius:10px;padding:22px}
+  .ch .t{font-family:'Playfair Display';font-size:18px;font-weight:700;margin-bottom:8px}
+  .ch.assert .t{color:var(--steel-light)} .ch.dissent .t{color:var(--ember)}
+  .ch p{font-size:14px;color:var(--bone-dim);line-height:1.55;font-weight:300}
+
+  /* veil — warm cools to system plane */
+  .veil-section{border-top:1px solid var(--line);background:linear-gradient(180deg, var(--ground) 0%, #141821 100%)}
+  .veil-section .kicker{color:var(--steel-light)}
+  .veil-line{margin:24px 0;height:2px;background:linear-gradient(90deg,var(--molten) 0%, var(--brass) 30%, var(--steel) 70%, var(--steel-deep) 100%);border-radius:2px}
+  .veil-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px;margin-top:22px}
+  .veil-card{background:#151a23;border:1px solid #243044;border-radius:12px;padding:24px 26px}
+  .veil-card .role{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--steel-light);font-weight:600;font-family:'Spectral'}
+  .veil-card h3{font-family:'Playfair Display';font-size:22px;font-weight:700;color:#cdd8e6;margin:7px 0 9px}
+  .veil-card p{font-size:14px;color:#9fb0c4;line-height:1.55;margin-bottom:14px;font-weight:300}
+  .veil-card a.enter{color:#7fd0f2;font-weight:600;font-size:14.5px;font-family:'Spectral'}
+  .veil-card a.enter:hover{color:#a9e0fb}
+
+  footer{padding:42px 0 56px;border-top:1px solid #243044;background:#141821;color:var(--steel);font-size:13px}
+  footer .wrap{font-family:'Spectral';max-width:1100px}
+  footer .prov{margin-top:9px;color:var(--steel-deep);font-size:12px}
+
+  @media(max-width:760px){.steps,.two-ch,.veil-grid{grid-template-columns:1fr}nav.top a.nl{display:none}}
+</style>
+</head>
+<body>
+
+<div class="ptbanner"><b>v0 · pressure-test</b> &nbsp;·&nbsp; not public, not indexed &nbsp;·&nbsp; built, used, still being challenged</div>
+
+<nav class="top"><div class="wrap">
+  <span class="brand"><span class="mark">&#9874;</span> The Parlor <span class="sep">/</span> <span class="pname">Witness</span></span>
+  <span class="spacer"></span>
+  <a class="nl" href="https://theparlor.github.io/portfolio-site/">&larr; All products</a>
+  <a class="veil" href="#veil">Behind the veil &rarr;</a>
+</div></nav>
+
+<header class="hero"><div class="wrap">
+  <div class="eyebrow">Awareness &amp; record</div>
+  <h1 class="title">Everything that happened, <em>verbatim</em>, forever.</h1>
+  <p class="lede">Witness is the append-only record at the bottom of the stack. Every session, agent dispatch, hook fire, MCP call, and cron run produces events — Witness captures them <strong>verbatim, attributed to their source</strong>, and never merges them. When you later ask "what led to this?", Witness can answer with a chain, not a shrug.</p>
+  <div class="forge-rule"></div>
+</div></header>
+
+<section><div class="wrap">
+  <div class="kicker">The problem it solves</div>
+  <h2>"What led to this signal?" shouldn't end in five different log formats.</h2>
+  <p class="body">A rich coherence stack produces signals, intents, decisions, and critiques &mdash; but the raw substrate those conclusions were drawn from fragments across tools, sessions, and agents, each in its own format. Today's signal says "Brien noticed X" but can't cite the discrete events that produced it. Witness closes that gap: one uniform event shape across every surface, one trace model connecting them, one lineage path from the raw moment back to every derived conclusion built on top of it.</p>
+  <div class="pull">A signal without a lineage is a belief. A signal with a lineage is evidence.</div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="kicker">How it works</div>
+  <h2>Capture once. Promote upward. Never destroy.</h2>
+  <div class="steps">
+    <div class="step"><div class="n">1</div><h3>Events arrive</h3><p>Sessions, agents, cron jobs, hooks, MCP backends, and external fetches all emit events. Witness ingests via OTLP spans or structured JSONL — each tagged with its source system so provenance is never ambiguous.</p></div>
+    <div class="step"><div class="n">2</div><h3>Events are stored verbatim</h3><p>Every event lands append-only in the event store, exactly as emitted, with its source attribution intact. Two contradictory claims from two agents produce two events &mdash; never a reconciled third event that erases the contradiction.</p></div>
+    <div class="step"><div class="n">3</div><h3>Events promote to signals</h3><p>When a pattern is worth surfacing, events are promoted to signals with preserved lineage &mdash; the raw events remain; the signal carries a <code>caused_by</code> pointer. The signal layer reads up; the record layer never changes.</p></div>
+  </div>
+</div></section>
+
+<section><div class="wrap">
+  <div class="kicker">What makes it different</div>
+  <h2>The conservation law: raw events are never destroyed.</h2>
+  <div class="law">
+    <div class="role">The rule the whole product is built around</div>
+    <h3>Aggregation at capture time is a conservation violation.</h3>
+    <p>Most observability tools merge, summarize, or deduplicate on ingest. Witness refuses. Every event is preserved verbatim, exactly as its source emitted it. Two agents producing contradictory claims produce two events &mdash; the contradiction is <strong>the information</strong>, not noise to be resolved. Aggregation is always a downstream derivation: Track 2 can promote events to signals, and signals can summarize, but the raw record is never touched. The output at the capture layer is always two channels that are <strong>never merged</strong>:</p>
+    <div class="two-ch">
+      <div class="ch assert"><div class="t">Raw events</div><p>Every discrete moment captured, stored append-only, attributed to source &mdash; the substrate every higher layer is built on.</p></div>
+      <div class="ch dissent"><div class="t">Promoted signals</div><p>Patterns worth acting on, elevated by Track 2 with a lineage pointer back to the raw events that produced them. The original events remain.</p></div>
+    </div>
+  </div>
+</div></section>
+
+<section id="veil" class="veil-section"><div class="wrap">
+  <div class="kicker">Behind the veil</div>
+  <h2>How Witness was forged.</h2>
+  <p class="body">Witness wasn't designed in a slide deck. It sits at the observability position in a coherence stack &mdash; below the signal layer, below Voices, Loom, and Topography &mdash; and was built and governed by the same machinery as every other product in this portfolio. Slip behind the veil to see the operating model that produced it and the system it composes into.</p>
+  <div class="veil-line"></div>
+  <div class="veil-grid">
+    <div class="veil-card">
+      <div class="role">The operating model</div>
+      <h3>Intent</h3>
+      <p>Witness carries its own <code>.intent/</code> governance &mdash; signals, specs, decisions, traced in git. The conservation law (append-only, no merge verb) is a ratified spec; the test suite enforces it on every CI run. SPEC-001 was ratified 2026-06-01 after both cross-product blockers cleared.</p>
+      <a class="enter" href="https://theparlor.github.io/intent-site/">See the operating model &rarr;</a>
+    </div>
+    <div class="veil-card">
+      <div class="role">The overhead view</div>
+      <h3>Parallax</h3>
+      <p>Witness occupies the <em>Awareness &amp; record</em> position in a larger coherence stack &mdash; the layer below every semantic surface, feeding the signals those surfaces draw meaning from. See where it sits among the other implements.</p>
+      <a class="enter" href="https://theparlor.github.io/parallax-site/">See the overhead view &rarr;</a>
+    </div>
+  </div>
+</div></section>
+
+<footer><div class="wrap">
+  <div><span class="mark" style="color:var(--brass)">&#9874;</span> The Parlor / Witness &mdash; <strong style="color:var(--steel-light)">v0, forged in the open</strong>. <a href="https://theparlor.github.io/portfolio-site/" style="color:var(--steel-light)">&larr; All products</a></div>
+  <div class="prov">Rendered in the Foundry type system (product plane). Source &amp; governance: <code style="color:var(--steel-deep)">Core/products/witness/</code> (behind the veil). noindex &middot; not public &middot; built to be challenged.</div>
+</div></footer>
+
+</body>
+</html>
