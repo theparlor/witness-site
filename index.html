@@ -144,6 +144,196 @@
   </div>
 </div></section>
 
+<section id="diagrams">
+<style>
+  #diagrams .diag-pair{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:32px}
+  #diagrams .diag-block{background:var(--ground-2);border:1px solid var(--line);border-radius:12px;padding:22px 20px 18px}
+  #diagrams .diag-label{font-size:11px;letter-spacing:2.5px;text-transform:uppercase;color:var(--brass);font-weight:600;margin-bottom:12px;font-family:'Spectral'}
+  @media(max-width:760px){#diagrams .diag-pair{grid-template-columns:1fr}}
+</style>
+<div class="wrap">
+  <div class="kicker">How it comes to be &middot; where it lives</div>
+  <h2>Two views of the record.</h2>
+  <p class="body">The first diagram traces how a single event moves through Witness — from raw ingestion (verbatim, source-tagged) through the append-only store (no merge verb, ever) to promotion into a signal with preserved lineage. The second shows where Witness sits in the portfolio: one layer below every semantic surface, governed by the Intent loop, composed with Conduit at the OTel seam.</p>
+
+  <div class="diag-pair">
+
+    <!-- DIAGRAM 1: FLOW — How it comes to be -->
+    <div class="diag-block">
+      <div class="diag-label">How it comes to be</div>
+      <svg viewBox="0 0 480 310" width="100%" height="auto" style="max-width:480px;display:block" xmlns="http://www.w3.org/2000/svg" aria-label="Flow diagram: how an event moves through Witness">
+        <defs>
+          <linearGradient id="wf-flow" x1="0" y1="0" x2="1" y2="0">
+            <stop offset="0%" stop-color="#E8772B"/>
+            <stop offset="100%" stop-color="#7E8A98"/>
+          </linearGradient>
+          <linearGradient id="wf-store" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#C9A45C" stop-opacity="0.22"/>
+            <stop offset="100%" stop-color="#2b2219" stop-opacity="0.9"/>
+          </linearGradient>
+          <marker id="warr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#C9A45C" opacity="0.75"/>
+          </marker>
+          <marker id="warr-steel" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#7E8A98" opacity="0.75"/>
+          </marker>
+          <marker id="warr-mol" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#E8772B" opacity="0.8"/>
+          </marker>
+        </defs>
+
+        <!-- Sources block — left: two ingest paths -->
+        <rect x="8" y="84" width="78" height="32" rx="6" fill="#2b2219" stroke="#E8772B" stroke-width="1.2"/>
+        <text x="47" y="97" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8.5" fill="#F2A24A">OTLP spans</text>
+        <text x="47" y="108" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8" fill="#9A7F4E">(Conduit · agents)</text>
+
+        <rect x="8" y="130" width="78" height="32" rx="6" fill="#2b2219" stroke="#E8772B" stroke-width="1.2"/>
+        <text x="47" y="143" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8.5" fill="#F2A24A">JSONL stderr</text>
+        <text x="47" y="154" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8" fill="#9A7F4E">(stdio MCP backends)</text>
+
+        <!-- "events arrive" label -->
+        <text x="47" y="76" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8" fill="#85795F" font-style="italic">events arrive</text>
+
+        <!-- Arrows sources → ingest node -->
+        <line x1="86" y1="100" x2="108" y2="115" stroke="#E8772B" stroke-width="1.1" stroke-opacity="0.8" marker-end="url(#warr)"/>
+        <line x1="86" y1="146" x2="108" y2="131" stroke="#E8772B" stroke-width="1.1" stroke-opacity="0.8" marker-end="url(#warr)"/>
+
+        <!-- Ingest node -->
+        <rect x="110" y="106" width="78" height="38" rx="7" fill="#2b2219" stroke="#C9A45C" stroke-width="1.4"/>
+        <text x="149" y="121" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="9" fill="#ECE3D4">tag_source</text>
+        <text x="149" y="134" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8.5" fill="#B3A890">verbatim</text>
+
+        <!-- Arrow ingest → store -->
+        <line x1="188" y1="125" x2="206" y2="125" stroke="#C9A45C" stroke-width="1.4" marker-end="url(#warr)"/>
+
+        <!-- Append-only store — central, larger box -->
+        <rect x="208" y="82" width="104" height="86" rx="9" fill="url(#wf-store)" stroke="#C9A45C" stroke-width="1.6"/>
+        <text x="260" y="103" text-anchor="middle" font-family="'Playfair Display',Georgia,serif" font-size="12" font-weight="700" fill="#C9A45C">Event Store</text>
+        <line x1="222" y1="110" x2="298" y2="110" stroke="#3a2f23" stroke-width="0.8"/>
+        <text x="260" y="123" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8" fill="#B3A890">append-only JSONL</text>
+        <text x="260" y="135" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8" fill="#B3A890">source attributed</text>
+        <!-- no-merge badge -->
+        <rect x="224" y="143" width="72" height="16" rx="5" fill="rgba(201,164,92,0.10)" stroke="#9A7F4E" stroke-width="0.8"/>
+        <text x="260" y="154" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7.5" fill="#C9A45C">no merge verb</text>
+
+        <!-- Two contradictory events illustration -->
+        <rect x="208" y="184" width="46" height="22" rx="5" fill="#211a13" stroke="#7E8A98" stroke-width="0.9"/>
+        <text x="231" y="197" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7.5" fill="#AAB4C0">event A</text>
+        <rect x="266" y="184" width="46" height="22" rx="5" fill="#211a13" stroke="#E8772B" stroke-width="0.9"/>
+        <text x="289" y="197" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7.5" fill="#F2A24A">event B*</text>
+        <text x="260" y="218" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7" fill="#9A7F4E" font-style="italic">* contradicts A — both preserved</text>
+
+        <!-- Arrow store → promote -->
+        <line x1="312" y1="125" x2="330" y2="125" stroke="#C9A45C" stroke-width="1.4" marker-end="url(#warr)"/>
+
+        <!-- Promotion node -->
+        <rect x="332" y="106" width="82" height="38" rx="7" fill="#2b2219" stroke="#C9A45C" stroke-width="1.2"/>
+        <text x="373" y="120" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8.5" fill="#ECE3D4">signal_emit</text>
+        <text x="373" y="132" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8" fill="#B3A890">Track 2</text>
+
+        <!-- Signal output -->
+        <line x1="414" y1="125" x2="428" y2="125" stroke="#7E8A98" stroke-width="1.2" marker-end="url(#warr-steel)"/>
+        <rect x="430" y="108" width="44" height="34" rx="6" fill="#17120e" stroke="#5B6573" stroke-width="1.2"/>
+        <text x="452" y="123" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8" fill="#AAB4C0">signal</text>
+        <text x="452" y="135" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7.5" fill="#7E8A98">caused_by</text>
+
+        <!-- lineage arrow back from signal to store -->
+        <path d="M452,142 Q452,168 390,175 Q320,182 260,172 Q235,168 230,168" fill="none" stroke="#9A7F4E" stroke-width="0.9" stroke-dasharray="3,3"/>
+        <text x="355" y="186" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7" fill="#85795F" font-style="italic">lineage pointer — raw events unchanged</text>
+
+        <!-- Bottom caption -->
+        <text x="240" y="296" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8" fill="#85795F">Ingest (verbatim) &rarr; Store (append-only, no merge) &rarr; Promote (lineage preserved)</text>
+      </svg>
+    </div>
+
+    <!-- DIAGRAM 2: ARCHITECTURE — Where it lives -->
+    <div class="diag-block">
+      <div class="diag-label">Where it lives</div>
+      <svg viewBox="0 0 480 310" width="100%" height="auto" style="max-width:480px;display:block" xmlns="http://www.w3.org/2000/svg" aria-label="Architecture diagram: Witness position in the portfolio">
+        <defs>
+          <linearGradient id="wa-witness" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#C9A45C" stop-opacity="0.22"/>
+            <stop offset="100%" stop-color="#2b2219" stop-opacity="0.9"/>
+          </linearGradient>
+          <linearGradient id="wa-signal" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0%" stop-color="#E8772B" stop-opacity="0.18"/>
+            <stop offset="100%" stop-color="#211a13" stop-opacity="0.8"/>
+          </linearGradient>
+          <marker id="aarr-w" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#C9A45C" opacity="0.8"/>
+          </marker>
+          <marker id="aarr-out-w" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#E8772B" opacity="0.8"/>
+          </marker>
+          <marker id="aarr-steel-w" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+            <path d="M0,0 L8,4 L0,8 Z" fill="#7E8A98" opacity="0.75"/>
+          </marker>
+        </defs>
+
+        <!-- Intent loop veil — faint background rectangle -->
+        <rect x="10" y="14" width="460" height="258" rx="12" fill="none" stroke="#3a2f23" stroke-width="1.5" stroke-dasharray="5,4"/>
+        <text x="26" y="28" font-family="Spectral,Georgia,serif" font-size="8.5" fill="#3a2f23" font-style="italic">Intent loop — Notice · Spec · Execute · Observe</text>
+
+        <!-- Signal layer — top tier (Voices · Loom · Topography) -->
+        <rect x="24" y="40" width="412" height="48" rx="9" fill="url(#wa-signal)" stroke="#E8772B" stroke-width="1.2"/>
+        <text x="230" y="58" text-anchor="middle" font-family="'Playfair Display',Georgia,serif" font-size="11" font-weight="700" fill="#F2A24A">Signal &amp; Semantic layer</text>
+        <text x="230" y="72" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8.5" fill="#B3A890">Voices (judgment) &nbsp;&middot;&nbsp; Loom (awareness) &nbsp;&middot;&nbsp; Topography (planning)</text>
+
+        <!-- Witness box — central -->
+        <rect x="148" y="114" width="180" height="90" rx="10" fill="url(#wa-witness)" stroke="#C9A45C" stroke-width="1.8"/>
+        <text x="238" y="138" text-anchor="middle" font-family="'Playfair Display',Georgia,serif" font-size="15" font-weight="800" fill="#ECE3D4">Witness</text>
+        <line x1="165" y1="146" x2="311" y2="146" stroke="#3a2f23" stroke-width="0.8"/>
+        <text x="238" y="160" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8.5" fill="#B3A890">Observability · record</text>
+        <!-- conservation law badge -->
+        <rect x="164" y="168" width="148" height="16" rx="5" fill="rgba(201,164,92,0.10)" stroke="#9A7F4E" stroke-width="0.8"/>
+        <text x="238" y="179" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7.5" fill="#C9A45C">append-only · no merge verb · verbatim</text>
+        <!-- port verbs -->
+        <text x="238" y="196" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7" fill="#85795F">ingest_otlp · ingest_jsonl · signal_emit · lineage</text>
+
+        <!-- Conduit box — left -->
+        <rect x="24" y="134" width="100" height="52" rx="9" fill="#211a13" stroke="#9A7F4E" stroke-width="1.1"/>
+        <text x="74" y="156" text-anchor="middle" font-family="'Playfair Display',Georgia,serif" font-size="12" font-weight="700" fill="#C9A45C">Conduit</text>
+        <text x="74" y="170" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8" fill="#85795F">OTLP emit</text>
+        <text x="74" y="180" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7.5" fill="#85795F">(WS-DDR-079)</text>
+
+        <!-- Other sources box — right -->
+        <rect x="352" y="134" width="108" height="52" rx="9" fill="#211a13" stroke="#7E8A98" stroke-width="1.1"/>
+        <text x="406" y="152" text-anchor="middle" font-family="'Playfair Display',Georgia,serif" font-size="10" font-weight="700" fill="#AAB4C0">Other sources</text>
+        <text x="406" y="165" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7.5" fill="#7E8A98">library-index</text>
+        <text x="406" y="176" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7.5" fill="#7E8A98">agents · hooks · cron</text>
+
+        <!-- Conduit → Witness OTel seam arrow -->
+        <line x1="124" y1="160" x2="146" y2="160" stroke="#C9A45C" stroke-width="1.4" marker-end="url(#aarr-w)"/>
+        <text x="135" y="153" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7" fill="#9A7F4E" font-style="italic">OTel</text>
+
+        <!-- Other sources → Witness arrow -->
+        <line x1="352" y1="160" x2="330" y2="160" stroke="#7E8A98" stroke-width="1.2" marker-end="url(#aarr-steel-w)"/>
+        <text x="341" y="153" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7" fill="#85795F" font-style="italic">JSONL</text>
+
+        <!-- Witness → Signal layer arrow (promote) -->
+        <line x1="238" y1="114" x2="238" y2="90" stroke="#E8772B" stroke-width="1.5" marker-end="url(#aarr-out-w)"/>
+        <text x="258" y="104" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7" fill="#9A7F4E" font-style="italic">promote</text>
+
+        <!-- One-of-N consumers note -->
+        <text x="74" y="198" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7" fill="#85795F" font-style="italic">preferred consumer</text>
+        <text x="74" y="208" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7" fill="#85795F" font-style="italic">not prerequisite</text>
+
+        <!-- Event store (raw) — bottom of Witness -->
+        <rect x="98" y="226" width="280" height="34" rx="8" fill="#17120e" stroke="#3a2f23" stroke-width="1"/>
+        <text x="238" y="240" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8.5" fill="#85795F">farm/events-store/ &nbsp;&middot;&nbsp; append-only JSONL &nbsp;&middot;&nbsp; gitignored</text>
+        <text x="238" y="252" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="7.5" fill="#5B6573">raw events never destroyed · contradiction is information</text>
+
+        <!-- Intent loop corner cycle arrow -->
+        <path d="M460,40 Q470,149 460,262" fill="none" stroke="#3a2f23" stroke-width="1" stroke-dasharray="4,5" marker-end="url(#aarr-w)"/>
+
+        <!-- Bottom label -->
+        <text x="238" y="296" text-anchor="middle" font-family="Spectral,Georgia,serif" font-size="8" fill="#85795F">Conduit (OTel seam) &rarr; Witness (record) &rarr; Signal layer &nbsp;&middot;&nbsp; governed by Intent loop</text>
+      </svg>
+    </div>
+
+  </div>
+</div></section>
+
 <section id="veil" class="veil-section"><div class="wrap">
   <div class="kicker">Behind the veil</div>
   <h2>How Witness was forged.</h2>
