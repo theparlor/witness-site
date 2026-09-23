@@ -40,9 +40,16 @@ def main():
     a = p.parse_args()
     if not (a.preflight or a.check): p.error("choose --preflight or --check")
     branch = git(ROOT, "branch", "--show-current").strip() or "(detached)"
-    changed = [line[3:] for line in git(ROOT, "status", "--porcelain=v1", "--untracked-files=all").splitlines() if len(line) > 3]
+    status = git(ROOT, "status", "--porcelain=v1", "--untracked-files=all").splitlines()
+    changed = [line[3:] for line in status if len(line) > 3]
+    # paths whose existing content changed (modified, deleted, renamed); additions are not in here
+    altered = {line[3:].split(" -> ")[0] for line in status if len(line) > 3 and line[:2].strip() and line[:2] not in ("??", "A ", "AM")}
     if a.against:
         changed = sorted(set(changed) | set(x for x in git(ROOT, "diff", "--name-only", f"{a.against}...HEAD", check=False).split("\n") if x))
+        for line in git(ROOT, "diff", "--name-status", f"{a.against}...HEAD", check=False).splitlines():
+            parts = line.split("\t")
+            if parts and parts[0][:1] in "MDRT" and len(parts) > 1:
+                altered.add(parts[1])
     if a.path:
         changed = [x for x in changed if any(x == q.rstrip("/") or x.startswith(q.rstrip("/") + "/") for q in a.path)]
     errors, warnings = [], []
@@ -55,8 +62,9 @@ def main():
         dc = subprocess.run(diff_args, cwd=ROOT, text=True, capture_output=True)
         if dc.returncode: errors.append("git diff --check failed: " + dc.stdout.strip()[:600])
         for root in POLICY.get("external_read_only_roots", []):
-            hits = [x for x in changed if x == root or x.startswith(root + "/")]
-            if hits: errors.append(f"external read-only paths changed under {root}: {', '.join(hits[:8])}")
+            # filing a new original is the point of these roots; changing an existing one is not
+            hits = [x for x in altered if x == root or x.startswith(root + "/")]
+            if hits: errors.append(f"external read-only paths modified, deleted or renamed under {root}: {', '.join(sorted(hits)[:8])}")
         for m in POLICY.get("generator_maps", []):
             output = any(match(x, pat) for x in changed for pat in m["outputs"])
             source = any(x in m["sources"] for x in changed)
