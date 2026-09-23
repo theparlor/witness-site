@@ -21,10 +21,16 @@ and merges through a pull request.
 
 1. **Main is the only long-lived branch.** The primary checkout stays on main. Nobody edits
    it, human or agent. It only ever moves forward by `git pull --ff-only`.
-2. **One session, one worktree, one branch.** A worktree is a sibling of the primary
-   checkout named `<repo>-wt-<task>`, on branch `agent/<provider>/<yyyy-mm-dd>-<task>`, cut
-   from `origin/main`. A session the Claude desktop app opened inside this repo already has
-   its own worktree; use that one.
+2. **One session, one worktree, one branch.** A session worktree lives in one of two places
+   and nowhere else. A worktree the kit makes (`session start <task>`) is a sibling of the
+   primary checkout named `<repo>-wt-<task>`, on branch `agent/<provider>/<yyyy-mm-dd>-<task>`,
+   cut from `origin/main`. A worktree the Claude desktop app makes when a session opens from
+   the repo's own folder lives at `<repo>/.claude/worktrees/<name>`, on the app's branch name;
+   it is already isolated and gitignored, and it is the worktree that session uses. Inside it,
+   `session start <task> --here` writes the task file and handoff of rule 3 without cutting a
+   second worktree. A worktree anywhere else (a session scratchpad, `/tmp`, a copy outside the
+   repo's folder) is not a session worktree and the hooks refuse it. A gate that refuses one of
+   the two valid places is wrong; correct the gate, never move the work to satisfy it.
 3. **Say what you own.** `session start` writes a task file under `.agents/tasks/` and a
    handoff under `.agents/handoffs/`. Name the paths you expect to change with `--own`.
    Overlap between two live sessions shows up in `session status` before either lands.
@@ -85,5 +91,7 @@ scratch paths in code, no two live tasks own the same path.
 ## What the hooks enforce
 
 A Claude Code hook blocks Write and Edit into the primary checkout of any repo that carries
-this file. Another blocks `git worktree add` to anywhere but the sibling pattern. Both print
-the command to run instead.
+this file. Another blocks `git worktree add` to anywhere but the sibling pattern (the desktop
+app makes its worktrees outside that hook, which is why they are the second valid place). Both
+print the command to run instead. A repo may add a commit-time backstop of its own (the Subaru
+engagement's pre-commit does); it must admit both valid places.
