@@ -26,6 +26,14 @@ def git(cwd, *a, check=True):
     return run(["git", *a], cwd, check).stdout.strip()
 
 
+def commit(cwd, provider, *a):
+    """Commit with AGENT_NAME set, for repos whose pre-commit checks handoff ownership."""
+    env = dict(os.environ, AGENT_NAME=os.environ.get("AGENT_NAME") or provider)
+    r = subprocess.run(["git", "commit", *a], cwd=cwd, text=True, capture_output=True, env=env)
+    if r.returncode:
+        sys.exit(f"session: commit failed in {cwd}:\n{(r.stderr or r.stdout).strip()}")
+
+
 def here():
     top = run(["git", "rev-parse", "--show-toplevel"], os.getcwd(), check=False)
     if top.returncode:
@@ -108,6 +116,7 @@ def cmd_start(a):
     (wt / ".agents" / "handoffs" / f"{tid}.md").write_text(body)
     print(f"worktree: {wt}\nbranch:   {branch}\ntask:     {tid}\n")
     print(f"Work only under {wt}. Commit there (specific files), then run:\n  python3 .agents/bin/session land")
+    print(f"Repos whose pre-commit checks ownership want: export AGENT_NAME={provider}")
     others = [s for s in sessions(primary) if s["path"] != str(wt)]
     if others:
         print(f"\n{len(others)} other live session(s) on this repo; run `python3 .agents/bin/session status` to see them.")
@@ -209,7 +218,7 @@ def cmd_land(a):
                 h.write_text(re.sub(r"^- Status: .*$", "- Status: complete", h.read_text(), count=1, flags=re.M))
                 git(top, "add", str(h.relative_to(top)))
             git(top, "add", str(t.relative_to(top)))
-            git(top, "commit", "-q", "-m", f"session: close {task['id']}")
+            commit(top, task.get("provider", "claude"), "-q", "-m", f"session: close {task['id']}")
     if git(top, "rev-list", "--count", f"origin/{base}..HEAD") == "0":
         sys.exit("session: nothing to land")
     r = run(["git", "rebase", f"origin/{base}"], top, check=False)
@@ -295,6 +304,7 @@ def cmd_finish(a):
     if "/.claude/worktrees/" in str(wt):
         print(f"left {wt} in place: the desktop app owns that worktree")
         return 0
+    os.chdir(primary)  # never remove the directory we are standing in
     git(primary, "worktree", "remove", str(wt))
     run(["git", "branch", "-D", branch], primary, check=False)
     print(f"removed {wt} and local branch {branch}")
