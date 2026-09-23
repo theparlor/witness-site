@@ -80,7 +80,7 @@ def my_task(root, base_ref):
 
 
 def cmd_start(a):
-    top, primary, _ = here()
+    top, primary, linked = here()
     if not SLUG.match(a.task):
         sys.exit("session: task must be a short slug of letters, digits, dot, dash, underscore")
     today = dt.date.today().isoformat()
@@ -88,17 +88,34 @@ def cmd_start(a):
     base = default_branch(primary)
     git(primary, "fetch", "-q", "origin", base)
     name = a.task if a.task.startswith(today) else f"{today}-{a.task}"
-    branch = f"agent/{provider}/{name}"
-    wt = primary.parent / f"{primary.name}-wt-{name}"
-    if wt.exists():
-        sys.exit(f"session: {wt} already exists; pick another task name or `cd` there")
-    base_commit = git(primary, "rev-parse", "--short", f"origin/{base}")
-    git(primary, "worktree", "add", "-q", "-b", branch, str(wt), f"origin/{base}")
     tid = f"{today}-{provider}-{a.task.removeprefix(today + '-')}"
+    if a.here:
+        # Adopt the worktree we are standing in, normally the Claude desktop app's
+        # <repo>/.claude/worktrees/<name>: no second worktree, no new branch, only the task file
+        # and handoff that let other sessions see what this one owns (SESSIONS.md rules 2 and 3).
+        if not linked:
+            sys.exit("session: --here adopts the session worktree you are standing in, and the primary "
+                     "checkout is not one; run `session start <task>` without --here to cut a sibling")
+        t = my_task(top, f"origin/{base}")
+        if t:
+            sys.exit(f"session: this worktree already has a task file: {t.relative_to(top)}")
+        wt = top
+        branch = git(top, "branch", "--show-current")
+        if not branch:
+            sys.exit("session: --here needs a branch checked out (this worktree is detached)")
+        base_commit = git(top, "rev-parse", "--short", git(top, "merge-base", f"origin/{base}", "HEAD"))
+    else:
+        branch = f"agent/{provider}/{name}"
+        wt = primary.parent / f"{primary.name}-wt-{name}"
+        if wt.exists():
+            sys.exit(f"session: {wt} already exists; pick another task name or `cd` there")
+        base_commit = git(primary, "rev-parse", "--short", f"origin/{base}")
+        git(primary, "worktree", "add", "-q", "-b", branch, str(wt), f"origin/{base}")
+    rel = os.path.relpath(wt, primary)
     (wt / ".agents" / "tasks").mkdir(parents=True, exist_ok=True)
     (wt / ".agents" / "handoffs").mkdir(parents=True, exist_ok=True)
     task = {"id": tid, "provider": provider, "status": "active", "branch": branch,
-            "worktree": wt.name, "base_commit": base_commit, "objective": a.objective or "",
+            "worktree": rel, "base_commit": base_commit, "objective": a.objective or "",
             "owned_paths": a.own, "started": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
             "handoff": f".agents/handoffs/{tid}.md"}
     (wt / ".agents" / "tasks" / f"{tid}.json").write_text(json.dumps(task, indent=2) + "\n")
@@ -108,14 +125,17 @@ def cmd_start(a):
             "- Status: planned | active | review-ready | blocked | complete": "- Status: active",
             "- Provider/agent:": f"- Provider/agent: {provider}",
             "- Objective:": f"- Objective: {a.objective or ''}",
-            "- Worktree and branch:": f"- Worktree and branch: `../{wt.name}`, `{branch}`",
+            "- Worktree and branch:": f"- Worktree and branch: `{rel}`, `{branch}`",
             "- Base and head commits:": f"- Base and head commits: base `{base_commit}`; head recorded at merge.",
             "- Owned paths:": "- Owned paths: " + ", ".join(f"`{p}`" for p in a.own)}
     for k, v in fill.items():
         body = body.replace(k, v, 1)
     (wt / ".agents" / "handoffs" / f"{tid}.md").write_text(body)
     print(f"worktree: {wt}\nbranch:   {branch}\ntask:     {tid}\n")
-    print(f"Work only under {wt}. Commit there (specific files), then run:\n  python3 .agents/bin/session land")
+    if a.here:
+        print(f"Adopted this worktree. Commit here (specific files), then run:\n  python3 .agents/bin/session land")
+    else:
+        print(f"Work only under {wt}. Commit there (specific files), then run:\n  python3 .agents/bin/session land")
     print(f"Repos whose pre-commit checks ownership want: export AGENT_NAME={provider}")
     others = [s for s in sessions(primary) if s["path"] != str(wt)]
     if others:
@@ -316,6 +336,7 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("start"); s.add_argument("task"); s.add_argument("--own", action="append", default=[])
     s.add_argument("--provider"); s.add_argument("--objective")
+    s.add_argument("--here", action="store_true", help="adopt the session worktree you are in (the desktop app's .claude/worktrees/<name>) instead of cutting a sibling")
     s = sub.add_parser("status"); s.add_argument("--json", action="store_true")
     s = sub.add_parser("land"); s.add_argument("--title"); s.add_argument("--no-merge", action="store_true")
     s.add_argument("--local", action="store_true", help="squash straight onto origin main without a PR (no GitHub)")
