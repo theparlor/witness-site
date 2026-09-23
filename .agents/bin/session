@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""Parallel-session helper for this repo. Standard: .agents/SESSIONS.md. Stdlib only.
+
+  session start <task> [--own PATH]... [--provider P] [--objective TEXT]
+  session status [--json]
+  session land [--title T] [--no-merge] [--local]
+  session finish [--task TASK]
+
+Managed by org-design-tooling/repo-kit; overwritten on every kit update.
+"""
+import argparse, datetime as dt, fnmatch, json, os, re, shutil, subprocess, sys
+from pathlib import Path
+
+SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
+FOOTER = "\n\n\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
+
+
+def run(args, cwd, check=True):
+    r = subprocess.run(args, cwd=cwd, text=True, capture_output=True)
+    if check and r.returncode:
+        sys.exit(f"session: `{' '.join(args)}` failed in {cwd}:\n{r.stderr.strip() or r.stdout.strip()}")
+    return r
+
+
+def git(cwd, *a, check=True):
+    return run(["git", *a], cwd, check).stdout.strip()
+
+
+def here():
+    top = run(["git", "rev-parse", "--show-toplevel"], os.getcwd(), check=False)
+    if top.returncode:
+        sys.exit("session: not inside a git repository")
+    top = Path(top.stdout.strip())
+    common = Path(git(top, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    primary = common.parent
+    return top, primary, top.resolve() != primary.resolve()
+
+
+def default_branch(repo):
+    r = run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"], repo, check=False)
+    return r.stdout.strip().split("/", 1)[1] if r.returncode == 0 and "/" in r.stdout else "main"
+
+
+def policy(root):
+    p = root / ".agents" / "repository-policy.json"
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return {}
+
+
+def task_files(root):
+    d = root / ".agents" / "tasks"
+    return sorted(d.glob("*.json")) if d.is_dir() else []
+
+
+def my_task(root, base_ref):
+    """The task file this branch added (not present on base)."""
+    added = git(root, "diff", "--name-only", "--diff-filter=A", f"{base_ref}...HEAD", "--", ".agents/tasks/", check=False).split()
+    untracked = git(root, "ls-files", "--others", "--exclude-standard", "--", ".agents/tasks/", check=False).split()
+    for rel in added + untracked:
+        if rel.endswith(".json"):
+            return root / rel
+    return None
+
+
+def cmd_start(a):
+    top, primary, _ = here()
+    if not SLUG.match(a.task):
+        sys.exit("session: task must be a short slug of letters, digits, dot, dash, underscore")
+    today = dt.date.today().isoformat()
+    provider = a.provider or os.environ.get("SESSION_PROVIDER") or "claude"
+    base = default_branch(primary)
+    git(primary, "fetch", "-q", "origin", base)
+    name = a.task if a.task.startswith(today) else f"{today}-{a.task}"
+    branch = f"agent/{provider}/{name}"
+    wt = primary.parent / f"{primary.name}-wt-{name}"
+    if wt.exists():
+        sys.exit(f"session: {wt} already exists; pick another task name or `cd` there")
+    base_commit = git(primary, "rev-parse", "--short", f"origin/{base}")
+    git(primary, "worktree", "add", "-q", "-b", branch, str(wt), f"origin/{base}")
+    tid = f"{today}-{provider}-{a.task.removeprefix(today + '-')}"
+    (wt / ".agents" / "tasks").mkdir(parents=True, exist_ok=True)
+    (wt / ".agents" / "handoffs").mkdir(parents=True, exist_ok=True)
+    task = {"id": tid, "provider": provider, "status": "active", "branch": branch,
+            "worktree": wt.name, "base_commit": base_commit, "objective": a.objective or "",
+            "owned_paths": a.own, "started": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "handoff": f".agents/handoffs/{tid}.md"}
+    (wt / ".agents" / "tasks" / f"{tid}.json").write_text(json.dumps(task, indent=2) + "\n")
+    tmpl = wt / ".agents" / "HANDOFF.template.md"
+    body = tmpl.read_text() if tmpl.exists() else "# Agent handoff: <task>\n"
+    fill = {"# Agent handoff: <task>": f"# Agent handoff: {a.task}",
+            "- Status: planned | active | review-ready | blocked | complete": "- Status: active",
+            "- Provider/agent:": f"- Provider/agent: {provider}",
+            "- Objective:": f"- Objective: {a.objective or ''}",
+            "- Worktree and branch:": f"- Worktree and branch: `../{wt.name}`, `{branch}`",
+            "- Base and head commits:": f"- Base and head commits: base `{base_commit}`; head recorded at merge.",
+            "- Owned paths:": "- Owned paths: " + ", ".join(f"`{p}`" for p in a.own)}
+    for k, v in fill.items():
+        body = body.replace(k, v, 1)
+    (wt / ".agents" / "handoffs" / f"{tid}.md").write_text(body)
+    print(f"worktree: {wt}\nbranch:   {branch}\ntask:     {tid}\n")
+    print(f"Work only under {wt}. Commit there (specific files), then run:\n  python3 .agents/bin/session land")
+    others = [s for s in sessions(primary) if s["path"] != str(wt)]
+    if others:
+        print(f"\n{len(others)} other live session(s) on this repo; run `python3 .agents/bin/session status` to see them.")
+
+
+def sessions(primary):
+    base = default_branch(primary)
+    out, cur = [], {}
+    for line in git(primary, "worktree", "list", "--porcelain").splitlines() + [""]:
+        if not line:
+            if cur:
+                out.append(cur)
+            cur = {}
+            continue
+        k, _, v = line.partition(" ")
+        cur[k] = v or True
+    res = []
+    for w in out:
+        p = Path(w["worktree"])
+        if p.resolve() == primary.resolve() or w.get("prunable") or not p.exists():
+            continue
+        br = str(w.get("branch", "")).removeprefix("refs/heads/") or "(detached)"
+        committed = git(p, "diff", "--name-only", f"origin/{base}...HEAD", check=False).split("\n")
+        dirty = [l[3:] for l in git(p, "status", "--porcelain=v1", "--untracked-files=all", check=False).splitlines() if len(l) > 3]
+        changed = sorted({x for x in committed + dirty if x})
+        counts = git(p, "rev-list", "--left-right", "--count", f"origin/{base}...HEAD", check=False).split()
+        t = my_task(p, f"origin/{base}")
+        task = json.loads(t.read_text()) if t and t.exists() else {}
+        res.append({"path": str(p), "branch": br, "task": task.get("id", ""), "status": task.get("status", ""),
+                    "objective": task.get("objective", ""), "owned_paths": task.get("owned_paths", []),
+                    "changed": changed, "uncommitted": len(dirty),
+                    "behind": int(counts[0]) if counts else 0, "ahead": int(counts[1]) if len(counts) > 1 else 0})
+    return res
+
+
+def overlaps(ss):
+    found = []
+    for i, l in enumerate(ss):
+        for r in ss[i + 1:]:
+            ignore = lambda x: x.startswith(".agents/tasks/") or x.startswith(".agents/handoffs/")
+            files = sorted(set(x for x in l["changed"] if not ignore(x)) & set(x for x in r["changed"] if not ignore(x)))
+            owned = [(lp, rp) for lp in l["owned_paths"] for rp in r["owned_paths"]
+                     if lp == rp or lp.startswith(rp.rstrip("/") + "/") or rp.startswith(lp.rstrip("/") + "/")]
+            if files or owned:
+                found.append({"left": l["branch"], "right": r["branch"], "files": files, "owned": owned})
+    return found
+
+
+def cmd_status(a):
+    _, primary, _ = here()
+    base = default_branch(primary)
+    run(["git", "fetch", "-q", "origin", base], primary, check=False)
+    ss = sessions(primary)
+    ov = overlaps(ss)
+    pbranch = git(primary, "branch", "--show-current", check=False) or "(detached)"
+    pdirty = len(git(primary, "status", "--porcelain", check=False).splitlines())
+    if a.json:
+        print(json.dumps({"primary": str(primary), "primary_branch": pbranch, "primary_dirty": pdirty,
+                          "sessions": ss, "overlaps": ov}, indent=2))
+        return 1 if ov else 0
+    print(f"primary: {primary}  on {pbranch}, {pdirty} uncommitted path(s)" +
+          ("" if pbranch == base else f"  WARNING: primary should be on {base}"))
+    if not ss:
+        print("no live sessions")
+    for s in ss:
+        print(f"\n- {s['branch']}  ({s['task'] or 'no task file'})\n  {s['path']}")
+        if s["objective"]:
+            print(f"  objective: {s['objective']}")
+        print(f"  {len(s['changed'])} changed file(s), {s['uncommitted']} uncommitted; {s['ahead']} ahead, {s['behind']} behind {base}")
+    for o in ov:
+        print(f"\nOVERLAP {o['left']} and {o['right']}: files {o['files'][:10]} owned {o['owned'][:5]}")
+    return 1 if ov else 0
+
+
+def ask_hits(changed, pol):
+    pats = pol.get("ask_paths", [])
+    return [x for x in changed for p in pats if fnmatch.fnmatch(x, p) or x == p.rstrip("/") or x.startswith(p.rstrip("/") + "/")]
+
+
+def cmd_land(a):
+    top, primary, linked = here()
+    if not linked:
+        sys.exit("session: land runs inside a session worktree, not the primary checkout")
+    base = default_branch(primary)
+    if git(top, "status", "--porcelain", "--untracked-files=no"):
+        sys.exit("session: commit or set aside your tracked changes first (never stash another session's work)")
+    if os.path.exists(os.path.join(git(top, "rev-parse", "--git-dir"), "rebase-merge")):
+        sys.exit("session: a rebase is in progress; resolve by meaning, `git add`, `git rebase --continue`, then land again")
+    git(top, "fetch", "-q", "origin", base)
+    t = my_task(top, f"origin/{base}")
+    if t:
+        task = json.loads(t.read_text())
+        if task.get("status") != "complete":
+            task["status"] = "complete"
+            task["landed"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+            t.write_text(json.dumps(task, indent=2) + "\n")
+            h = top / task.get("handoff", "")
+            if h.is_file():
+                h.write_text(re.sub(r"^- Status: .*$", "- Status: complete", h.read_text(), count=1, flags=re.M))
+                git(top, "add", str(h.relative_to(top)))
+            git(top, "add", str(t.relative_to(top)))
+            git(top, "commit", "-q", "-m", f"session: close {task['id']}")
+    if git(top, "rev-list", "--count", f"origin/{base}..HEAD") == "0":
+        sys.exit("session: nothing to land")
+    r = run(["git", "rebase", f"origin/{base}"], top, check=False)
+    if r.returncode:
+        files = git(top, "diff", "--name-only", "--diff-filter=U", check=False)
+        print("REBASE CONFLICT. Another session landed changes to the same lines:\n" + files)
+        print("\nResolve by meaning: keep both sessions' intents, never drop theirs to make yours apply.\n"
+              "Then `git add <files>`, `git rebase --continue`, and run `python3 .agents/bin/session land` again.")
+        return 3
+    audit = top / ".agents" / "bin" / "agent_repo_audit.py"
+    if audit.exists():
+        ar = run([sys.executable, str(audit), "--check", "--against", f"origin/{base}"], top, check=False)
+        print(ar.stdout.strip())
+        if ar.returncode:
+            sys.exit("session: audit found errors; fix them and land again")
+    branch = git(top, "branch", "--show-current")
+    changed = git(top, "diff", "--name-only", f"origin/{base}...HEAD").split()
+    if a.local:
+        head = git(top, "rev-parse", "HEAD")
+        subject = a.title or f"{branch}: land"
+        tree = git(top, "rev-parse", f"{head}^{{tree}}")
+        squash = git(top, "commit-tree", tree, "-p", f"origin/{base}", "-m", subject)
+        git(top, "push", "-q", "origin", f"{squash}:refs/heads/{base}")
+        print(f"landed locally as {squash[:8]} on origin/{base}")
+        return 0
+    git(top, "push", "-q", "--force-with-lease", "-u", "origin", branch)
+    pr = run(["gh", "pr", "view", branch, "--json", "url", "-q", ".url"], top, check=False)
+    if pr.returncode:
+        subjects = git(top, "log", "--reverse", "--format=%s", f"origin/{base}..HEAD").splitlines()
+        title = a.title or next((x for x in subjects if not x.startswith("session: close")), branch)
+        body = "Session branch landed under .agents/SESSIONS.md.\n\nChanged: " + ", ".join(f"`{c}`" for c in changed[:30])
+        if t:
+            h = top / json.loads(t.read_text()).get("handoff", "")
+            if h.is_file():
+                body = h.read_text()[:6000]
+        pr = run(["gh", "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body + FOOTER], top)
+    url = pr.stdout.strip().splitlines()[-1]
+    print(f"PR: {url}")
+    hits = ask_hits(changed, policy(top))
+    if hits or a.no_merge:
+        print("Left open for a human" + (f": touches ask paths {sorted(set(hits))[:8]}" if hits else ""))
+        return 0
+    m = run(["gh", "pr", "merge", url, "--squash", "--delete-branch", "--auto"], top, check=False)
+    if m.returncode:
+        m = run(["gh", "pr", "merge", url, "--squash", "--delete-branch"], top, check=False)
+    state = run(["gh", "pr", "view", url, "--json", "state", "-q", ".state"], top, check=False).stdout.strip()
+    print(f"PR state: {state or 'unknown'}" + ("" if m.returncode == 0 else f"\n{m.stderr.strip()}"))
+    if state == "MERGED":
+        print("Next: python3 .agents/bin/session finish")
+    return 0
+
+
+def cmd_finish(a):
+    top, primary, linked = here()
+    base = default_branch(primary)
+    if linked:
+        wt = top
+    else:
+        cands = [s for s in sessions(primary) if a.task and a.task in (s["branch"] + s["task"] + s["path"])]
+        if len(cands) != 1:
+            sys.exit("session: from the primary checkout, name the session with --task")
+        wt = Path(cands[0]["path"])
+    branch = git(wt, "branch", "--show-current")
+    git(primary, "fetch", "-q", "--prune", "origin")
+    st = run(["gh", "pr", "view", branch, "--json", "state", "-q", ".state"], wt, check=False).stdout.strip()
+    mine = [x for x in git(wt, "diff", "--name-only", f"origin/{base}...HEAD", check=False).split("\n") if x]
+    contained = not mine or not git(wt, "diff", "--name-only", "HEAD", f"origin/{base}", "--", *mine, check=False)
+    if st != "MERGED" and not contained:
+        sys.exit(f"session: {branch} is not merged (PR state {st or 'none'}); land it first")
+    if git(wt, "status", "--porcelain"):
+        sys.exit(f"session: {wt} has uncommitted changes; they are not yours to discard")
+    if git(primary, "branch", "--show-current", check=False) == base:
+        r = run(["git", "merge", "--ff-only", "-q", f"origin/{base}"], primary, check=False)
+        print("primary fast-forwarded" if r.returncode == 0 else f"primary NOT fast-forwarded: {r.stderr.strip()[:200]}")
+    if "/.claude/worktrees/" in str(wt):
+        print(f"left {wt} in place: the desktop app owns that worktree")
+        return 0
+    git(primary, "worktree", "remove", str(wt))
+    run(["git", "branch", "-D", branch], primary, check=False)
+    print(f"removed {wt} and local branch {branch}")
+    return 0
+
+
+def main():
+    p = argparse.ArgumentParser(prog="session", description="Parallel sessions: see .agents/SESSIONS.md")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("start"); s.add_argument("task"); s.add_argument("--own", action="append", default=[])
+    s.add_argument("--provider"); s.add_argument("--objective")
+    s = sub.add_parser("status"); s.add_argument("--json", action="store_true")
+    s = sub.add_parser("land"); s.add_argument("--title"); s.add_argument("--no-merge", action="store_true")
+    s.add_argument("--local", action="store_true", help="squash straight onto origin main without a PR (no GitHub)")
+    s = sub.add_parser("finish"); s.add_argument("--task")
+    a = p.parse_args()
+    return {"start": cmd_start, "status": cmd_status, "land": cmd_land, "finish": cmd_finish}[a.cmd](a) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
