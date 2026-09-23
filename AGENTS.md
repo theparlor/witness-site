@@ -8,5 +8,5 @@ Start with `python3 .agents/bin/session start <task> --own <path>` and work in t
 prints. See who else is working here with `python3 .agents/bin/session status`. When your
 commits are in, run `python3 .agents/bin/session land`, then `python3 .agents/bin/session finish`.
 A rebase conflict with another session is resolved by meaning, keeping both intents. The full
-standard is `.agents/SESSIONS.md` (kit v6).
+standard is `.agents/SESSIONS.md` (kit v7).
 <!-- session-kit:end -->

@@ -62,8 +62,11 @@ def main():
         dc = subprocess.run(diff_args, cwd=ROOT, text=True, capture_output=True)
         if dc.returncode: errors.append("git diff --check failed: " + dc.stdout.strip()[:600])
         for root in POLICY.get("external_read_only_roots", []):
-            # filing a new original is the point of these roots; changing an existing one is not
-            hits = [x for x in altered if x == root or x.startswith(root + "/")]
+            # filing a new original is the point of these roots; changing an existing one is not.
+            # The root's own index (CONTEXT.md, the Workspaces zero-orphaned-files rule) is not an
+            # original: filing anything requires editing it, so it is exempt from the immutability check.
+            index_files = {root + "/" + n for n in POLICY.get("read_only_root_index_files", ["CONTEXT.md"])}
+            hits = [x for x in altered if (x == root or x.startswith(root + "/")) and x not in index_files]
             if hits: errors.append(f"external read-only paths modified, deleted or renamed under {root}: {', '.join(sorted(hits)[:8])}")
         for m in POLICY.get("generator_maps", []):
             output = any(match(x, pat) for x in changed for pat in m["outputs"])
