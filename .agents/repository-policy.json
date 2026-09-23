@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "external_read_only_roots": ["from-client", "raw"],
+  "generated_patterns": ["**/generated/**", "**/dist/**", "**/__pycache__/**", "*.pyc"],
+  "generator_maps": [],
+  "non_durable_path_literals": ["/private/tmp/claude-", "/tmp/claude-"],
+  "non_durable_path_scan_suffixes": [".py", ".sh", ".json", ".yaml", ".yml", ".toml", ".cfg", ".ini"],
+  "ask_paths": []
+}
