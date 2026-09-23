@@ -41,6 +41,13 @@ def default_branch(repo):
     return r.stdout.strip().split("/", 1)[1] if r.returncode == 0 and "/" in r.stdout else "main"
 
 
+def gh_repo(root):
+    """owner/name of origin, so gh never guesses between origin and an upstream remote."""
+    url = git(root, "remote", "get-url", "origin", check=False)
+    m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
+    return ["-R", m.group(1)] if m else []
+
+
 def policy(root):
     p = root / ".agents" / "repository-policy.json"
     try:
@@ -229,7 +236,7 @@ def cmd_land(a):
         print(f"landed locally as {squash[:8]} on origin/{base}")
         return 0
     git(top, "push", "-q", "--force-with-lease", "-u", "origin", branch)
-    pr = run(["gh", "pr", "view", branch, "--json", "url", "-q", ".url"], top, check=False)
+    pr = run(["gh", "pr", "view", branch, *gh_repo(top), "--json", "url", "-q", ".url"], top, check=False)
     if pr.returncode:
         subjects = git(top, "log", "--reverse", "--format=%s", f"origin/{base}..HEAD").splitlines()
         title = a.title or next((x for x in subjects if not x.startswith("session: close")), branch)
@@ -238,20 +245,26 @@ def cmd_land(a):
             h = top / json.loads(t.read_text()).get("handoff", "")
             if h.is_file():
                 body = h.read_text()[:6000]
-        pr = run(["gh", "pr", "create", "--head", branch, "--base", base, "--title", title, "--body", body + FOOTER], top)
+        pr = run(["gh", "pr", "create", *gh_repo(top), "--head", branch, "--base", base, "--title", title, "--body", body + FOOTER], top)
     url = pr.stdout.strip().splitlines()[-1]
     print(f"PR: {url}")
     hits = ask_hits(changed, policy(top))
     if hits or a.no_merge:
         print("Left open for a human" + (f": touches ask paths {sorted(set(hits))[:8]}" if hits else ""))
         return 0
-    m = run(["gh", "pr", "merge", url, "--squash", "--delete-branch", "--auto"], top, check=False)
+    m = run(["gh", "pr", "merge", url, *gh_repo(top), "--squash", "--delete-branch", "--auto"], top, check=False)
     if m.returncode:
-        m = run(["gh", "pr", "merge", url, "--squash", "--delete-branch"], top, check=False)
-    state = run(["gh", "pr", "view", url, "--json", "state", "-q", ".state"], top, check=False).stdout.strip()
-    print(f"PR state: {state or 'unknown'}" + ("" if m.returncode == 0 else f"\n{m.stderr.strip()}"))
+        m = run(["gh", "pr", "merge", url, *gh_repo(top), "--squash", "--delete-branch"], top, check=False)
+    info = run(["gh", "pr", "view", url, *gh_repo(top), "--json", "state,autoMergeRequest", "-q",
+                "[.state, (.autoMergeRequest != null)] | @tsv"], top, check=False).stdout.strip().split("\t")
+    state, armed = (info + ["", ""])[:2]
     if state == "MERGED":
-        print("Next: python3 .agents/bin/session finish")
+        print("PR merged. Next: python3 .agents/bin/session finish")
+    elif armed == "true":
+        print("Auto-merge armed: the PR squash-merges by itself when its checks pass.\n"
+              "Then: python3 .agents/bin/session finish")
+    else:
+        print(f"PR state: {state or 'unknown'}, not merged" + (f"\n{m.stderr.strip()}" if m.returncode else ""))
     return 0
 
 
@@ -267,10 +280,12 @@ def cmd_finish(a):
         wt = Path(cands[0]["path"])
     branch = git(wt, "branch", "--show-current")
     git(primary, "fetch", "-q", "--prune", "origin")
-    st = run(["gh", "pr", "view", branch, "--json", "state", "-q", ".state"], wt, check=False).stdout.strip()
+    st = run(["gh", "pr", "view", branch, *gh_repo(wt), "--json", "state", "-q", ".state"], wt, check=False).stdout.strip()
     mine = [x for x in git(wt, "diff", "--name-only", f"origin/{base}...HEAD", check=False).split("\n") if x]
     contained = not mine or not git(wt, "diff", "--name-only", "HEAD", f"origin/{base}", "--", *mine, check=False)
     if st != "MERGED" and not contained:
+        if st == "OPEN":
+            sys.exit(f"session: the PR for {branch} is still open (checks running or awaiting a human); finish again once it merges")
         sys.exit(f"session: {branch} is not merged (PR state {st or 'none'}); land it first")
     if git(wt, "status", "--porcelain"):
         sys.exit(f"session: {wt} has uncommitted changes; they are not yours to discard")
