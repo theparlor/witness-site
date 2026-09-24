@@ -79,6 +79,36 @@ def my_task(root, base_ref):
     return None
 
 
+def primary_behind(primary, base):
+    """How many commits origin/<base> has that the primary's HEAD lacks (no fetch here)."""
+    n = git(primary, "rev-list", "--count", f"HEAD..origin/{base}", check=False)
+    return int(n) if n.isdigit() else 0
+
+
+def ff_primary(primary, base):
+    """Fast-forward the primary checkout to origin/<base>: the one place the kit ever moves it.
+
+    Never force, never reset, never stash, never touch a primary that is not on its base branch:
+    a parked branch, a detached HEAD or a colliding local edit all leave it alone and say so.
+    Returns True when the primary now equals origin/<base>."""
+    run(["git", "fetch", "-q", "origin", base], primary, check=False)
+    on = git(primary, "branch", "--show-current", check=False)
+    if on != base:
+        print(f"primary NOT fast-forwarded: it is on {on or '(detached)'}, not {base}; it lags origin/{base} by "
+              f"{primary_behind(primary, base)} until {base} is checked out and `session finish` runs")
+        return False
+    if primary_behind(primary, base) == 0:
+        print(f"primary already at origin/{base} ({git(primary, 'rev-parse', '--short', 'HEAD', check=False)})")
+        return True
+    r = run(["git", "merge", "--ff-only", "-q", f"origin/{base}"], primary, check=False)
+    if r.returncode:
+        reason = " ".join((r.stderr or r.stdout).strip().split())[:200]
+        print(f"primary NOT fast-forwarded: {reason}")
+        return False
+    print(f"primary fast-forwarded to {git(primary, 'rev-parse', '--short', 'HEAD', check=False)}")
+    return True
+
+
 def cmd_start(a):
     top, primary, linked = here()
     if not SLUG.match(a.task):
@@ -193,12 +223,15 @@ def cmd_status(a):
     ov = overlaps(ss)
     pbranch = git(primary, "branch", "--show-current", check=False) or "(detached)"
     pdirty = len(git(primary, "status", "--porcelain", check=False).splitlines())
+    pbehind = primary_behind(primary, base)
     if a.json:
         print(json.dumps({"primary": str(primary), "primary_branch": pbranch, "primary_dirty": pdirty,
-                          "sessions": ss, "overlaps": ov}, indent=2))
+                          "primary_behind": pbehind, "sessions": ss, "overlaps": ov}, indent=2))
         return 1 if ov else 0
     print(f"primary: {primary}  on {pbranch}, {pdirty} uncommitted path(s)" +
           ("" if pbranch == base else f"  WARNING: primary should be on {base}"))
+    print(f"primary: {pbehind} behind origin/{base}" +
+          ("" if pbehind == 0 else "  (run `session finish` for a landed session, or wait for the hub's primary-ff sweep)"))
     if not ss:
         print("no live sessions")
     for s in ss:
@@ -263,6 +296,7 @@ def cmd_land(a):
         squash = git(top, "commit-tree", tree, "-p", f"origin/{base}", "-m", subject)
         git(top, "push", "-q", "origin", f"{squash}:refs/heads/{base}")
         print(f"landed locally as {squash[:8]} on origin/{base}")
+        ff_primary(primary, base)
         return 0
     git(top, "push", "-q", "--force-with-lease", "-u", "origin", branch)
     pr = run(["gh", "pr", "view", branch, *gh_repo(top), "--json", "url", "-q", ".url"], top, check=False)
@@ -288,9 +322,13 @@ def cmd_land(a):
                 "[.state, (.autoMergeRequest != null)] | @tsv"], top, check=False).stdout.strip().split("\t")
     state, armed = (info + ["", ""])[:2]
     if state == "MERGED":
-        print("PR merged. Next: python3 .agents/bin/session finish")
+        print("PR merged.")
+        ff_primary(primary, base)
+        print("Next: python3 .agents/bin/session finish")
     elif armed == "true":
         print("Auto-merge armed: the PR squash-merges by itself when its checks pass.\n"
+              f"Until then nothing moves the primary: it lags origin/{base} after the merge until\n"
+              "`python3 .agents/bin/session finish` runs or the hub's primary-ff sweep passes (every 30 min).\n"
               "Then: python3 .agents/bin/session finish")
     else:
         print(f"PR state: {state or 'unknown'}, not merged" + (f"\n{m.stderr.strip()}" if m.returncode else ""))
@@ -318,9 +356,7 @@ def cmd_finish(a):
         sys.exit(f"session: {branch} is not merged (PR state {st or 'none'}); land it first")
     if git(wt, "status", "--porcelain"):
         sys.exit(f"session: {wt} has uncommitted changes; they are not yours to discard")
-    if git(primary, "branch", "--show-current", check=False) == base:
-        r = run(["git", "merge", "--ff-only", "-q", f"origin/{base}"], primary, check=False)
-        print("primary fast-forwarded" if r.returncode == 0 else f"primary NOT fast-forwarded: {r.stderr.strip()[:200]}")
+    ff_primary(primary, base)
     if "/.claude/worktrees/" in str(wt):
         print(f"left {wt} in place: the desktop app owns that worktree")
         return 0
