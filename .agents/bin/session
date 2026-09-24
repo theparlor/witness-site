@@ -3,10 +3,15 @@
 
   session start <task> [--own PATH]... [--provider P] [--objective TEXT]
   session status [--json]
-  session land [--title T] [--no-merge] [--local]
+  session land [--title T] [--pr] [--no-merge] [--local]
   session finish [--task TASK]
 
 Managed by org-design-tooling/repo-kit; overwritten on every kit update.
+`start` and `land` turn on the pre-push portability check for this clone (activate_prepush);
+`land` runs the same check itself before it pushes.
+`land` lands locally by default (squash onto origin/<base>, fast-forward push, no GitHub run);
+it opens a PR only for ask paths, a base branch whose ruleset or protection requires a PR or
+status checks, or `--pr` (WS-DDR-143 amendment 2026-09-24).
 """
 import argparse, datetime as dt, fnmatch, json, os, re, shutil, subprocess, sys
 from pathlib import Path
@@ -109,6 +114,59 @@ def ff_primary(primary, base):
     return True
 
 
+HOOK_NAME = "session-kit-portability"
+HOOK_CMD = "test ! -f .agents/hooks/pre-push || sh .agents/hooks/pre-push"
+SHIM_MARK = "# session-kit pre-push shim"
+
+
+def activate_prepush(repo):
+    """Turn on .agents/hooks/pre-push for this clone without displacing any existing hook.
+
+    Git 2.54+ config hooks run beside the hook directory's own pre-push (Entire, a repo's
+    .githooks), so this only adds. On an older git, a .git/hooks/pre-push shim is written only
+    when core.hooksPath is unset and no pre-push hook exists. Same logic as repo-kit/install.py."""
+    have = git(repo, "config", "--get", f"hook.{HOOK_NAME}.command", check=False)
+    if have != HOOK_CMD:
+        git(repo, "config", f"hook.{HOOK_NAME}.event", "pre-push", check=False)
+        git(repo, "config", f"hook.{HOOK_NAME}.command", HOOK_CMD, check=False)
+    listed = run(["git", "hook", "list", "pre-push"], repo, check=False)
+    if listed.returncode == 0 and HOOK_NAME in listed.stdout:
+        return
+    if git(repo, "config", "--get", "core.hooksPath", check=False):
+        print("note: pre-push portability check not activated (core.hooksPath is set and this git has no "
+              "config hooks); `session land` still runs it")
+        return
+    shim = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "hooks" / "pre-push"
+    if shim.exists():
+        if SHIM_MARK not in shim.read_text(errors="replace"):
+            print("note: pre-push portability check not activated (a pre-push hook exists and this git has no "
+                  "config hooks); `session land` still runs it")
+        return
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text(f"#!/bin/sh\n{SHIM_MARK} (org-design-tooling/repo-kit)\n{HOOK_CMD} \"$@\"\n")
+    shim.chmod(0o755)
+
+
+def portability_check(top):
+    """The pre-push check, run by land before it pushes. Returns True when it passes or is absent."""
+    chk = top / ".agents" / "bin" / "portability-check"
+    if not chk.is_file():
+        return True
+    r = run([sys.executable, str(chk)], top, check=False)
+    out = (r.stdout + r.stderr).strip()
+    if out:
+        print(out)
+    if r.returncode == 0:
+        # the pre-push hook sees this and skips re-running the check on the same commit
+        os.environ["SESSION_PORTABILITY_CHECKED"] = git(top, "rev-parse", "HEAD")
+    return r.returncode == 0
+
+
+def pushed(top, rev="HEAD"):
+    """True when rev is already on some remote-tracking branch (never amend a pushed commit)."""
+    return bool(git(top, "branch", "-r", "--contains", rev, check=False))
+
+
 def cmd_start(a):
     top, primary, linked = here()
     if not SLUG.match(a.task):
@@ -141,6 +199,7 @@ def cmd_start(a):
             sys.exit(f"session: {wt} already exists; pick another task name or `cd` there")
         base_commit = git(primary, "rev-parse", "--short", f"origin/{base}")
         git(primary, "worktree", "add", "-q", "-b", branch, str(wt), f"origin/{base}")
+    activate_prepush(primary)
     rel = os.path.relpath(wt, primary)
     (wt / ".agents" / "tasks").mkdir(parents=True, exist_ok=True)
     (wt / ".agents" / "handoffs").mkdir(parents=True, exist_ok=True)
@@ -249,6 +308,50 @@ def ask_hits(changed, pol):
     return [x for x in changed for p in pats if fnmatch.fnmatch(x, p) or x == p.rstrip("/") or x.startswith(p.rstrip("/") + "/")]
 
 
+def requires_pr(top, base):
+    """Why the base branch must be reached through a PR, or "" when a direct push is allowed.
+
+    A ruleset rule of type pull_request or required_status_checks, or classic branch protection
+    that requires reviews or status checks. When GitHub cannot be asked, returns "" and the
+    push itself is the test: a rejected protected-branch push falls back to a PR."""
+    R = gh_repo(top)
+    if not R:
+        return ""
+    r = run(["gh", "api", f"repos/{R[1]}/rules/branches/{base}"], top, check=False)
+    if r.returncode == 0:
+        try:
+            types = {x.get("type") for x in json.loads(r.stdout or "[]")}
+        except ValueError:
+            types = set()
+        hit = sorted(types & {"pull_request", "required_status_checks"})
+        if hit:
+            return f"a ruleset on {base} requires {' and '.join(hit)}"
+    p = run(["gh", "api", f"repos/{R[1]}/branches/{base}/protection"], top, check=False)
+    if p.returncode == 0:
+        try:
+            prot = json.loads(p.stdout or "{}")
+        except ValueError:
+            prot = {}
+        if prot.get("required_pull_request_reviews") or prot.get("required_status_checks"):
+            return f"branch protection on {base} requires reviews or status checks"
+    return ""
+
+
+def land_message(top, base, title, branch):
+    """Squash message for a local landing: the session's subject, each commit's subject, and the
+    commits' trailers (Co-Authored-By and the like) carried over once each."""
+    subjects = [x for x in git(top, "log", "--reverse", "--format=%s", f"origin/{base}..HEAD").splitlines()
+                if not x.startswith("session: close")]
+    subject = title or (subjects[0] if subjects else f"{branch}: land")
+    trailers = []
+    for l in git(top, "log", "--reverse", "--format=%(trailers:only,unfold)", f"origin/{base}..HEAD").splitlines():
+        if l.strip() and l not in trailers:
+            trailers.append(l)
+    body = "\n".join(f"- {x}" for x in subjects) if len(subjects) > 1 else ""
+    note = f"Landed locally by session land from {branch} (WS-DDR-143 amendment 2026-09-24)."
+    return "\n\n".join(x for x in (subject, body, note, "\n".join(trailers)) if x)
+
+
 def cmd_land(a):
     top, primary, linked = here()
     if not linked:
@@ -259,6 +362,7 @@ def cmd_land(a):
     if os.path.exists(os.path.join(git(top, "rev-parse", "--git-dir"), "rebase-merge")):
         sys.exit("session: a rebase is in progress; resolve by meaning, `git add`, `git rebase --continue`, then land again")
     git(top, "fetch", "-q", "origin", base)
+    activate_prepush(top)
     t = my_task(top, f"origin/{base}")
     if t:
         task = json.loads(t.read_text())
@@ -271,7 +375,14 @@ def cmd_land(a):
                 h.write_text(re.sub(r"^- Status: .*$", "- Status: complete", h.read_text(), count=1, flags=re.M))
                 git(top, "add", str(h.relative_to(top)))
             git(top, "add", str(t.relative_to(top)))
-            commit(top, task.get("provider", "claude"), "-q", "-m", f"session: close {task['id']}")
+            # Fold the close into the session's own last commit when that commit has not left the
+            # machine: a separate `session: close` commit cost its own CI cycle (about 20 percent of
+            # session CI, measured 2026-09-24). A commit already pushed is never amended.
+            ahead = git(top, "rev-list", "--count", f"origin/{base}..HEAD") != "0"
+            if ahead and not pushed(top):
+                commit(top, task.get("provider", "claude"), "-q", "--amend", "--no-edit")
+            else:
+                commit(top, task.get("provider", "claude"), "-q", "-m", f"session: close {task['id']}")
     if git(top, "rev-list", "--count", f"origin/{base}..HEAD") == "0":
         sys.exit("session: nothing to land")
     r = run(["git", "rebase", f"origin/{base}"], top, check=False)
@@ -287,17 +398,47 @@ def cmd_land(a):
         print(ar.stdout.strip())
         if ar.returncode:
             sys.exit("session: audit found errors; fix them and land again")
+    if not portability_check(top):
+        sys.exit("session: portability check failed (the check CI used to run on every push); fix it and land again")
     branch = git(top, "branch", "--show-current")
     changed = git(top, "diff", "--name-only", f"origin/{base}...HEAD").split()
-    if a.local:
-        head = git(top, "rev-parse", "HEAD")
-        subject = a.title or f"{branch}: land"
-        tree = git(top, "rev-parse", f"{head}^{{tree}}")
-        squash = git(top, "commit-tree", tree, "-p", f"origin/{base}", "-m", subject)
-        git(top, "push", "-q", "origin", f"{squash}:refs/heads/{base}")
-        print(f"landed locally as {squash[:8]} on origin/{base}")
-        ff_primary(primary, base)
-        return 0
+    # Local landing is the default (WS-DDR-143 amendment 2026-09-24): the checks already ran here,
+    # so a PR would only buy a second, billed run of them. A PR is used for ask paths (a human
+    # decides), for a base branch that requires one, or when asked for with --pr or --no-merge.
+    hits = ask_hits(changed, policy(top))
+    why_pr = ("--pr" if a.pr else "--no-merge" if a.no_merge else
+              f"touches ask paths {sorted(set(hits))[:8]}" if hits and not a.local else
+              "" if a.local else requires_pr(top, base))
+    if not why_pr:
+        for attempt in range(3):
+            tree = git(top, "rev-parse", "HEAD^{tree}")
+            squash = git(top, "commit-tree", tree, "-p", f"origin/{base}", "-m", land_message(top, base, a.title, branch))
+            p = run(["git", "push", "-q", "origin", f"{squash}:refs/heads/{base}"], top, check=False)
+            if p.returncode == 0:
+                print(f"landed locally as {squash[:8]} on origin/{base} (no PR, no CI run)")
+                ff_primary(primary, base)
+                print("Next: python3 .agents/bin/session finish")
+                return 0
+            err = (p.stderr or p.stdout).strip()
+            if re.search(r"protected branch|GH006|GH013|rule violations|required status check|pull request", err, re.I):
+                why_pr = f"the push to {base} was refused: {' '.join(err.split())[:160]}"
+                break
+            if "fetch first" not in err and "non-fast-forward" not in err and "rejected" not in err:
+                sys.exit(f"session: push to {base} failed:\n{err}")
+            # someone landed in between: take their change and go again
+            git(top, "fetch", "-q", "origin", base)
+            r = run(["git", "rebase", f"origin/{base}"], top, check=False)
+            if r.returncode:
+                files = git(top, "diff", "--name-only", "--diff-filter=U", check=False)
+                print("REBASE CONFLICT. Another session landed changes to the same lines:\n" + files)
+                print("\nResolve by meaning: keep both sessions' intents, never drop theirs to make yours apply.\n"
+                      "Then `git add <files>`, `git rebase --continue`, and run `python3 .agents/bin/session land` again.")
+                return 3
+            if not portability_check(top):
+                sys.exit("session: portability check failed after the rebase; fix it and land again")
+        else:
+            sys.exit(f"session: origin/{base} kept moving; run `python3 .agents/bin/session land` again")
+    print(f"Landing through a PR: {why_pr}")
     git(top, "push", "-q", "--force-with-lease", "-u", "origin", branch)
     pr = run(["gh", "pr", "view", branch, *gh_repo(top), "--json", "url", "-q", ".url"], top, check=False)
     if pr.returncode:
@@ -311,7 +452,6 @@ def cmd_land(a):
         pr = run(["gh", "pr", "create", *gh_repo(top), "--head", branch, "--base", base, "--title", title, "--body", body + FOOTER], top)
     url = pr.stdout.strip().splitlines()[-1]
     print(f"PR: {url}")
-    hits = ask_hits(changed, policy(top))
     if hits or a.no_merge:
         print("Left open for a human" + (f": touches ask paths {sorted(set(hits))[:8]}" if hits else ""))
         return 0
@@ -374,8 +514,10 @@ def main():
     s.add_argument("--provider"); s.add_argument("--objective")
     s.add_argument("--here", action="store_true", help="adopt the session worktree you are in (the desktop app's .claude/worktrees/<name>) instead of cutting a sibling")
     s = sub.add_parser("status"); s.add_argument("--json", action="store_true")
-    s = sub.add_parser("land"); s.add_argument("--title"); s.add_argument("--no-merge", action="store_true")
-    s.add_argument("--local", action="store_true", help="squash straight onto origin main without a PR (no GitHub)")
+    s = sub.add_parser("land"); s.add_argument("--title")
+    s.add_argument("--pr", action="store_true", help="land through a pull request even where local landing is allowed")
+    s.add_argument("--no-merge", action="store_true", help="open the PR and leave it for a human")
+    s.add_argument("--local", action="store_true", help="land locally even for ask paths (skips the ruleset lookup)")
     s = sub.add_parser("finish"); s.add_argument("--task")
     a = p.parse_args()
     return {"start": cmd_start, "status": cmd_status, "land": cmd_land, "finish": cmd_finish}[a.cmd](a) or 0

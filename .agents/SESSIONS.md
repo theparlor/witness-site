@@ -15,7 +15,7 @@ Two sessions can work on this repo at the same time, on two different questions,
 can land. That only works when neither session writes to the shared checkout. Each one works
 in its own copy (a git worktree) on its own short-lived branch. When a session is done, it
 rebases onto whatever main now holds, including anything the other session already landed,
-and merges through a pull request.
+runs the checks on the machine, and lands as one squashed commit on main.
 
 ## The rules
 
@@ -39,10 +39,15 @@ and merges through a pull request.
 5. **Settling two sessions.** Whoever lands second rebases onto the first one's result.
    A conflict is analysis work, not a text merge: read what both sessions meant, keep both
    intents, then continue. Never discard the other session's change to make yours apply.
-6. **Squash merge through a PR, branch deleted on merge.** The repo only allows squash
-   merges and deletes the branch when the PR merges.
-7. **Ship, show, ask.** Changes inside your owned paths ship: the PR merges when checks
-   pass. Paths listed in `ask_paths` in `.agents/repository-policy.json` wait for a human.
+6. **Land locally by default, as one squashed commit.** `session land` squashes the branch onto
+   `origin/main` and pushes it as a fast-forward: no pull request and no pull-request CI run,
+   because the checks already ran on the machine (WS-DDR-143 amendment 2026-09-24). It uses a
+   pull request (squash merge, branch deleted on merge) only when the change touches an ask
+   path (rule 7), when main has a ruleset or protection that requires a pull request or status
+   checks, or when you pass `--pr`. A direct push GitHub refuses as protected falls back to a PR.
+7. **Ship, show, ask.** Changes inside your owned paths ship: they land locally, or the PR
+   merges when checks pass. Paths listed in `ask_paths` in `.agents/repository-policy.json`
+   go through a PR that waits for a human.
 8. **Regenerable output is not committed from a working branch.** If a pipeline can rebuild
    it, it is gitignored or landed by that pipeline's own snapshot step.
 9. **Never destroy another session's work.** No `reset --hard`, no `clean`, no stash of
@@ -71,11 +76,16 @@ checkout is visible before anyone opens a stale file from it.
 python3 .agents/bin/session land
 ```
 
-Run inside your worktree once your work is committed. It closes your task file, rebases onto
-`origin/main`, runs the audit, pushes, opens the PR and squash-merges it, or leaves it open
-for a human when it touches an ask path. When the merge completes in line, `land` also
-fast-forwards the primary checkout; when auto-merge is armed (checks still running) the
-primary lags until `finish` runs or the hub's primary-ff sweep passes, and `land` says so. If the rebase hits a conflict it stops and lists
+Run inside your worktree once your work is committed. It closes your task file (folded into
+your last commit when that commit has not been pushed yet, so there is no separate
+`session: close` commit to pay CI for), rebases onto `origin/main`, runs the audit and the
+portability check, then lands: by default as one squashed commit pushed straight to main
+(retrying the rebase if another session landed in between), and through a PR where rule 6
+says so, squash-merging it or leaving it open for a human when it touches an ask path.
+`--pr` forces a PR; `--no-merge` opens one and leaves it. When the landing completes in line,
+`land` also fast-forwards the primary checkout; when a PR's auto-merge is armed (checks still
+running) the primary lags until `finish` runs or the hub's primary-ff sweep passes, and `land`
+says so. If the rebase hits a conflict it stops and lists
 the files: resolve them by meaning, `git add` them, `git rebase --continue`, run `land` again.
 
 ```bash
@@ -91,6 +101,26 @@ python3 .agents/bin/agent_repo_audit.py --check
 
 Read-only checks: read-only roots untouched, generated output has its source, no session
 scratch paths in code, no two live tasks own the same path.
+
+## Checks run on this machine, before the push
+
+`.agents/bin/portability-check` is the check GitHub Actions used to run on every push: the
+repo's own no-hardcoded-home test (`test_no_hardcoded_home.py` or `test-no-hardcoded-home.sh`,
+wherever it is tracked; pytest is not needed) and a syntax check of every tracked `*.sh` and
+`*.bash` by its shebang. Paths under `external_read_only_roots` and `portability_exclude` in
+`.agents/repository-policy.json` are skipped. It runs in three places:
+
+1. **Before every push**, as a git pre-push hook: `.agents/hooks/pre-push`, turned on per clone
+   by `session start`, `session land` and the kit installer as a config hook
+   (`hook.session-kit-portability.*`, git 2.54 or later). A config hook runs beside any pre-push
+   hook the repo or a tool already has; it never replaces one. On an older git the kit writes a
+   `.git/hooks/pre-push` shim, but only where no pre-push hook exists.
+2. **In `session land`**, after the audit and before the push. A failure stops the land.
+3. **In CI, as a backstop only.** Where the kit manages `.github/workflows/portability.yml`, it
+   runs on pushes to main and on pull requests, only when a file the check reads changed, and a
+   newer run on the same ref cancels the older one. A hand-customized workflow is left alone.
+
+Fix a failure here; do not push around it.
 
 ## What the hooks enforce
 
