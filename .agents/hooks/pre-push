@@ -1,0 +1,16 @@
+#!/bin/sh
+# Session kit pre-push check. Managed by org-design-tooling/repo-kit; overwritten on every kit update.
+#
+# Runs .agents/bin/portability-check (the no-hardcoded-home test and the shell syntax check that CI
+# used to run on every push) before anything leaves the machine. Activated per clone by
+# `session start`, `session land` or install.py as a git config hook:
+#   hook.session-kit-portability.event   = pre-push
+#   hook.session-kit-portability.command = test ! -f .agents/hooks/pre-push || sh .agents/hooks/pre-push
+# A config hook runs beside any pre-push hook already in .git/hooks or core.hooksPath (Entire, a
+# repo's own .githooks), never instead of it. On a git too old for config hooks (before 2.54) the
+# kit installs .git/hooks/pre-push pointing here, but only when no pre-push hook exists there.
+top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+chk="$top/.agents/bin/portability-check"
+[ -f "$chk" ] || exit 0
+py=$(command -v python3) || { echo "pre-push: python3 not found; portability check skipped" >&2; exit 0; }
+exec "$py" "$chk" --hook "$@"

@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Portability check for this repo: the one CI used to run on every push, run locally instead.
+
+  portability-check            run it (exit 0 pass, 1 fail)
+  portability-check --hook     as a git pre-push hook: read the pushed refs on stdin first
+  portability-check --list     print what it would check, run nothing
+
+Two parts, both over tracked files in the working tree:
+1. The repo's own no-hardcoded-home test(s): every tracked `test_no_hardcoded_home.py` (its
+   zero-argument `test_*` functions, called directly, so pytest need not be installed) and
+   every tracked `test-no-hardcoded-home.sh` (run with bash).
+2. A syntax check of every tracked `*.sh` and `*.bash` file by its shebang: a file whose first
+   line names python is compiled as Python (some .sh files are Python), any other with `bash -n`.
+
+Paths under `external_read_only_roots` and `portability_exclude` in
+.agents/repository-policy.json are skipped (client originals, raw imports, archives).
+
+It runs from three places: the pre-push hook (.agents/hooks/pre-push), `session land` before
+it pushes, and the lean CI workflow that is the backstop on main and on pull requests.
+Managed by org-design-tooling/repo-kit; overwritten on every kit update. Stdlib only.
+"""
+import json, os, subprocess, sys
+from pathlib import Path
+
+TESTS_PY = "test_no_hardcoded_home.py"
+TESTS_SH = "test-no-hardcoded-home.sh"
+ZERO = "0" * 40
+
+RUNNER = r"""
+import importlib.util, inspect, sys, traceback
+path = sys.argv[1]
+sys.path.insert(0, __import__("os").path.dirname(path))
+spec = importlib.util.spec_from_file_location("portability_home_test", path)
+mod = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(mod)
+except ModuleNotFoundError as e:
+    print(f"NEEDS-PYTEST {e}"); sys.exit(3)
+fails = ran = 0
+for name, fn in list(vars(mod).items()):
+    if not (name.startswith("test") and inspect.isfunction(fn) and fn.__module__ == mod.__name__):
+        continue
+    if any(p.default is p.empty for p in inspect.signature(fn).parameters.values()):
+        print(f"NEEDS-PYTEST {name} takes fixtures"); sys.exit(3)
+    ran += 1
+    try:
+        fn()
+    except AssertionError as e:
+        fails += 1; print(f"FAIL {name}\n{e}")
+    except Exception:
+        fails += 1; print(f"ERROR {name}\n{traceback.format_exc(limit=3)}")
+print(f"ran {ran} test(s), {fails} failed")
+sys.exit(1 if fails else 0)
+"""
+
+
+def git(top, *a):
+    return subprocess.run(["git", *a], cwd=top, capture_output=True, text=True).stdout
+
+
+def excluded_prefixes(top):
+    try:
+        pol = json.loads((top / ".agents" / "repository-policy.json").read_text())
+    except Exception:
+        pol = {}
+    roots = list(pol.get("external_read_only_roots", [])) + list(pol.get("portability_exclude", []))
+    return tuple(r.rstrip("/") + "/" for r in roots if r)
+
+
+def tracked(top, *specs):
+    out = subprocess.run(["git", "ls-files", "-z", "--", *specs], cwd=top, capture_output=True).stdout.decode()
+    return [p for p in out.split("\0") if p]
+
+
+def plan(top):
+    skip = excluded_prefixes(top)
+    keep = lambda p: not p.startswith(skip) and (top / p).is_file()
+    tests = [p for p in tracked(top, f"*{TESTS_PY}", f"*{TESTS_SH}") if keep(p) and "/archive/" not in f"/{p}"
+             and os.path.basename(p) in (TESTS_PY, TESTS_SH)]
+    shells = [p for p in tracked(top, "*.sh", "*.bash") if keep(p)]
+    return tests, shells
+
+
+def run_home_test(top, rel):
+    path = top / rel
+    if rel.endswith(".sh"):
+        r = subprocess.run(["bash", str(path)], cwd=top, capture_output=True, text=True)
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    r = subprocess.run([sys.executable, "-c", RUNNER, str(path)], cwd=top, capture_output=True, text=True)
+    if r.returncode == 3:
+        p = subprocess.run([sys.executable, "-m", "pytest", "-q", "--noconftest", "-o", "addopts=",
+                            "-p", "no:cacheprovider", str(path)], cwd=top, capture_output=True, text=True)
+        if "No module named pytest" in p.stderr:
+            return True, f"skipped: {r.stdout.strip()} and pytest is not installed here (CI still runs it)"
+        return p.returncode == 0, (p.stdout + p.stderr).strip()[-3000:]
+    return r.returncode == 0, (r.stdout + r.stderr).strip()[-3000:]
+
+
+def syntax(top, rel):
+    path = top / rel
+    try:
+        first = path.open("rb").readline().decode("utf-8", "replace")
+    except OSError as e:
+        return False, str(e)
+    if "python" in first:
+        try:
+            compile(path.read_bytes(), rel, "exec")  # in-process: no __pycache__ left behind
+            return True, ""
+        except (SyntaxError, ValueError) as e:
+            return False, f"python: {e}"
+    r = subprocess.run(["bash", "-n", str(path)], cwd=top, capture_output=True, text=True)
+    return r.returncode == 0, r.stderr.strip()
+
+
+def main():
+    args = sys.argv[1:]
+    top = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip() or ".")
+    if "--hook" in args:
+        refs = [l.split() for l in sys.stdin.read().splitlines() if l.strip()]
+        if refs and all(len(r) == 4 and r[1] == ZERO for r in refs):
+            return 0  # only deleting remote refs: nothing to check
+        done = os.environ.get("SESSION_PORTABILITY_CHECKED", "")
+        if done and done == git(top, "rev-parse", "HEAD").strip() and not git(top, "status", "--porcelain", "--untracked-files=no").strip():
+            return 0  # `session land` just ran this check on this exact commit
+    tests, shells = plan(top)
+    if "--list" in args:
+        print("\n".join([f"home-test {t}" for t in tests] + [f"syntax    {s}" for s in shells]))
+        return 0
+    bad = []
+    for t in tests:
+        ok, out = run_home_test(top, t)
+        if not ok:
+            bad.append(f"{t}:\n{out}")
+        elif out.startswith("skipped"):
+            print(f"portability: {t} {out}")
+    for s in shells:
+        ok, out = syntax(top, s)
+        if not ok:
+            bad.append(f"syntax error in {s}: {out}")
+    if bad:
+        print("portability check FAILED (the same check CI runs; fix it here, before the push):\n\n" +
+              "\n\n".join(bad), file=sys.stderr)
+        return 1
+    print(f"portability ok: {len(tests)} home-path test file(s), {len(shells)} shell file(s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
