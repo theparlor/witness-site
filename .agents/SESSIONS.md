@@ -63,7 +63,9 @@ python3 .agents/bin/session status
 ```
 
 Lists every live session on this repo: its branch, what it has changed, how far behind main
-it is, and any file two sessions both touch.
+it is, and any file two sessions both touch. It also prints how far behind `origin/main` the
+primary checkout is (`primary: N behind`), so a landed change that has not reached the shared
+checkout is visible before anyone opens a stale file from it.
 
 ```bash
 python3 .agents/bin/session land
@@ -71,7 +73,9 @@ python3 .agents/bin/session land
 
 Run inside your worktree once your work is committed. It closes your task file, rebases onto
 `origin/main`, runs the audit, pushes, opens the PR and squash-merges it, or leaves it open
-for a human when it touches an ask path. If the rebase hits a conflict it stops and lists
+for a human when it touches an ask path. When the merge completes in line, `land` also
+fast-forwards the primary checkout; when auto-merge is armed (checks still running) the
+primary lags until `finish` runs or the hub's primary-ff sweep passes, and `land` says so. If the rebase hits a conflict it stops and lists
 the files: resolve them by meaning, `git add` them, `git rebase --continue`, run `land` again.
 
 ```bash
