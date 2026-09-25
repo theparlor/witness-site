@@ -426,6 +426,31 @@ def cmd_start(a):
         print(f"\n{len(others)} other live session(s) on this repo; run `python3 .agents/bin/session status` to see them.")
 
 
+def name_list(cwd, *a, check=True):
+    """`git diff --name-only` read with -z: unstripped and unquoted. Without -z git prints a path with
+    a non-ASCII byte as a quoted escape (core.quotePath, on by default), which matches no ask path
+    and, passed back as a pathspec, no file."""
+    return [x for x in run(["git", "diff", "--name-only", "-z", *a], cwd, check).stdout.split("\0") if x]
+
+
+def changed_paths(wt, base):
+    """Paths a worktree changes: committed since the base plus uncommitted. Both are read with -z,
+    unstripped and unquoted: `git()` strips its output, which ate the leading space of the first
+    porcelain line (` M path`) and so the path's first character (Subaru, 2026-09-25), and without
+    -z git quotes a path with a space or a non-ASCII byte. A rename gives both its old and new path,
+    because another session touching either one is an overlap."""
+    committed = name_list(wt, "--no-renames", f"origin/{base}...HEAD", check=False)
+    fields = run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], wt, check=False).stdout.split("\0")
+    dirty = []
+    while fields:
+        e = fields.pop(0)
+        if len(e) > 3:
+            dirty.append(e[3:])
+            if {"R", "C"} & set(e[:2]) and fields:
+                dirty.append(fields.pop(0))
+    return sorted(set(committed + dirty)), dirty
+
+
 def sessions(primary):
     base = default_branch(primary)
     out, cur = [], {}
@@ -443,9 +468,7 @@ def sessions(primary):
         if p.resolve() == primary.resolve() or w.get("prunable") or not p.exists():
             continue
         br = str(w.get("branch", "")).removeprefix("refs/heads/") or "(detached)"
-        committed = git(p, "diff", "--name-only", f"origin/{base}...HEAD", check=False).split("\n")
-        dirty = [l[3:] for l in git(p, "status", "--porcelain=v1", "--untracked-files=all", check=False).splitlines() if len(l) > 3]
-        changed = sorted({x for x in committed + dirty if x})
+        changed, dirty = changed_paths(p, base)
         counts = git(p, "rev-list", "--left-right", "--count", f"origin/{base}...HEAD", check=False).split()
         t = my_task(p, f"origin/{base}")
         task = json.loads(t.read_text()) if t and t.exists() else {}
@@ -595,7 +618,7 @@ def cmd_land(a):
             sys.exit("session: audit found errors; fix them and land again")
     if not portability_check(top):
         sys.exit("session: portability check failed (the check CI used to run on every push); fix it and land again")
-    changed = git(top, "diff", "--name-only", f"origin/{base}...HEAD").split()
+    changed = name_list(top, "--no-renames", f"origin/{base}...HEAD")
     # Local landing is the default (WS-DDR-143 amendment 2026-09-24): the checks already ran here,
     # so a PR would only buy a second, billed run of them. A PR is used for ask paths (a human
     # decides), for a base branch that requires one, or when asked for with --pr or --no-merge.
@@ -689,8 +712,8 @@ def cmd_finish(a):
     git(primary, "fetch", "-q", "--prune", "origin")
     st, pr_head = (run(["gh", "pr", "view", branch, *gh_repo(wt), "--json", "state,headRefOid", "-q",
                         "[.state, .headRefOid] | @tsv"], wt, check=False).stdout.strip().split("\t") + ["", ""])[:2]
-    mine = [x for x in git(wt, "diff", "--name-only", f"origin/{base}...HEAD", check=False).split("\n") if x]
-    contained = not mine or not git(wt, "diff", "--name-only", "HEAD", f"origin/{base}", "--", *mine, check=False)
+    mine = name_list(wt, "--no-renames", f"origin/{base}...HEAD", check=False)
+    contained = not mine or not name_list(wt, "HEAD", f"origin/{base}", "--", *mine, check=False)
     # a merged PR counts only when it merged this head: commits made after an earlier landing have not landed
     if not (st == "MERGED" and pr_head == git(wt, "rev-parse", "HEAD")) and not contained:
         if st == "MERGED":
