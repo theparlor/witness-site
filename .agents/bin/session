@@ -12,6 +12,8 @@ Managed by org-design-tooling/repo-kit; overwritten on every kit update.
 `land` lands locally by default (squash onto origin/<base>, fast-forward push, no GitHub run);
 it opens a PR only for ask paths, a base branch whose ruleset or protection requires a PR or
 status checks, or `--pr` (WS-DDR-143 amendment 2026-09-24).
+After a landing the session branch follows its squash, and a later `land` from the same worktree
+skips any commits that already landed, so it never replays them onto their own squash (kit 12).
 """
 import argparse, datetime as dt, fnmatch, json, os, re, shutil, subprocess, sys
 from pathlib import Path
@@ -160,6 +162,86 @@ def portability_check(top):
         # the pre-push hook sees this and skips re-running the check on the same commit
         os.environ["SESSION_PORTABILITY_CHECKED"] = git(top, "rev-parse", "HEAD")
     return r.returncode == 0
+
+
+def follow(top, landed, head, base):
+    """Point the session branch at the commit that landed it. Only when the trees match, so the
+    working tree and index stay as they are; compare-and-swap on the old head, never a reset."""
+    if git(top, "rev-parse", "-q", "--verify", f"{landed}^{{tree}}", check=False) != git(top, "rev-parse", f"{head}^{{tree}}"):
+        return False
+    r = run(["git", "update-ref", "-m", f"session land: follow the landing on origin/{base}", "HEAD", landed, head], top, check=False)
+    if r.returncode == 0:
+        print(f"branch now at {landed[:8]}: a later land from this worktree replays only new commits")
+    return r.returncode == 0
+
+
+def has_gh():
+    return shutil.which("gh") is not None
+
+
+def landed_boundary(top, base, branch):
+    """Where an earlier landing from this branch ends: (newest landed commit of ours, rebase target,
+    why) or None. Kit 11 and earlier left the branch on its unsquashed commits after a landing, and
+    an auto-merged PR still does; rebasing those onto origin/<base> replays them onto their own
+    squash, and batches that touched the same lines conflict with themselves.
+
+    A local landing's squash has the tree of the branch head it landed, so a commit on origin/<base>
+    with the same tree as one of ours marks it. A PR that GitHub squashed after origin/<base> moved
+    has a tree of its own; for a branch that was pushed for a PR, GitHub says which head it merged."""
+    mine = [l.split() for l in git(top, "log", "--format=%H %T", f"origin/{base}..HEAD", check=False).splitlines()]
+    if not mine:
+        return None
+    landed = {}
+    for h, t in (l.split() for l in git(top, "log", "--reverse", "--format=%H %T", f"HEAD..origin/{base}", check=False).splitlines()):
+        landed.setdefault(t, h)
+    for h, t in mine:  # newest first
+        if t in landed:
+            return h, landed[t], f"its tree is {landed[t][:8]} on origin/{base}"
+    if branch and has_gh() and git(top, "config", "--get", f"branch.{branch}.merge", check=False):
+        r = run(["gh", "pr", "list", *gh_repo(top), "--head", branch, "--state", "merged",
+                 "--json", "number,headRefOid", "--limit", "50"], top, check=False)
+        try:
+            heads = {x["headRefOid"]: x["number"] for x in json.loads(r.stdout or "[]")} if r.returncode == 0 else {}
+        except (ValueError, KeyError, TypeError):
+            heads = {}
+        for h, _ in mine:
+            if h in heads:
+                return h, f"origin/{base}", f"PR #{heads[h]} merged it"
+    return None
+
+
+def rebase_on_base(top, base, branch):
+    """Rebase the session branch onto origin/<base>, first skipping commits that already landed.
+    Returns True, or reports the conflict and returns False (the rebase stays open to resolve)."""
+    skipped = ""
+    b = landed_boundary(top, base, branch)
+    if b:
+        c, onto, why = b
+        n = git(top, "rev-list", "--count", f"origin/{base}..{c}")
+        rest = git(top, "rev-list", "--count", f"{c}..HEAD")
+        skipped = f"{n} commit(s) on this branch already landed ({why})"
+        print(f"{skipped}; replaying only the {rest} after them")
+        r = run(["git", "rebase", "--onto", onto, c], top, check=False)
+    if not b or r.returncode == 0:
+        mb = git(top, "merge-base", "HEAD", f"origin/{base}", check=False)
+        r = run(["git", "rebase", f"origin/{base}"], top, check=False)
+        if r.returncode == 0:
+            return True
+    else:
+        mb = ""
+    files = git(top, "diff", "--name-only", "--diff-filter=U", check=False)
+    print("REBASE CONFLICT. Another session landed changes to the same lines:\n" + files)
+    if skipped:
+        print(f"(Not a replay of this branch's own landing: {skipped} and were skipped first.)")
+    elif mb and branch:
+        mine = git(top, "log", "--format=%h", "-F", f"--grep={branch}", f"{mb}..origin/{base}", check=False).split()
+        if mine:
+            print(f"Check first: {', '.join(mine)} on origin/{base} names this branch. If that is this branch's own "
+                  f"earlier landing, `git rebase --abort`, then `git rebase --onto origin/{base} <the last commit "
+                  "of yours it carries>`, and land again.")
+    print("\nResolve by meaning: keep both sessions' intents, never drop theirs to make yours apply.\n"
+          "Then `git add <files>`, `git rebase --continue`, and run `python3 .agents/bin/session land` again.")
+    return False
 
 
 def pushed(top, rev="HEAD"):
@@ -383,15 +465,14 @@ def cmd_land(a):
                 commit(top, task.get("provider", "claude"), "-q", "--amend", "--no-edit")
             else:
                 commit(top, task.get("provider", "claude"), "-q", "-m", f"session: close {task['id']}")
+    branch = git(top, "branch", "--show-current")
     if git(top, "rev-list", "--count", f"origin/{base}..HEAD") == "0":
         sys.exit("session: nothing to land")
-    r = run(["git", "rebase", f"origin/{base}"], top, check=False)
-    if r.returncode:
-        files = git(top, "diff", "--name-only", "--diff-filter=U", check=False)
-        print("REBASE CONFLICT. Another session landed changes to the same lines:\n" + files)
-        print("\nResolve by meaning: keep both sessions' intents, never drop theirs to make yours apply.\n"
-              "Then `git add <files>`, `git rebase --continue`, and run `python3 .agents/bin/session land` again.")
+    if not rebase_on_base(top, base, branch):
         return 3
+    if git(top, "rev-list", "--count", f"origin/{base}..HEAD") == "0":
+        print(f"nothing new to land: everything on this branch is already on origin/{base}")
+        return 0
     audit = top / ".agents" / "bin" / "agent_repo_audit.py"
     if audit.exists():
         ar = run([sys.executable, str(audit), "--check", "--against", f"origin/{base}"], top, check=False)
@@ -400,7 +481,6 @@ def cmd_land(a):
             sys.exit("session: audit found errors; fix them and land again")
     if not portability_check(top):
         sys.exit("session: portability check failed (the check CI used to run on every push); fix it and land again")
-    branch = git(top, "branch", "--show-current")
     changed = git(top, "diff", "--name-only", f"origin/{base}...HEAD").split()
     # Local landing is the default (WS-DDR-143 amendment 2026-09-24): the checks already ran here,
     # so a PR would only buy a second, billed run of them. A PR is used for ask paths (a human
@@ -411,11 +491,13 @@ def cmd_land(a):
               "" if a.local else requires_pr(top, base))
     if not why_pr:
         for attempt in range(3):
-            tree = git(top, "rev-parse", "HEAD^{tree}")
-            squash = git(top, "commit-tree", tree, "-p", f"origin/{base}", "-m", land_message(top, base, a.title, branch))
+            head = git(top, "rev-parse", "HEAD")
+            squash = git(top, "commit-tree", f"{head}^{{tree}}", "-p", f"origin/{base}", "-m", land_message(top, base, a.title, branch))
             p = run(["git", "push", "-q", "origin", f"{squash}:refs/heads/{base}"], top, check=False)
             if p.returncode == 0:
                 print(f"landed locally as {squash[:8]} on origin/{base} (no PR, no CI run)")
+                # the branch follows its squash (same tree): a later land replays only what is new
+                follow(top, squash, head, base)
                 ff_primary(primary, base)
                 print("Next: python3 .agents/bin/session finish")
                 return 0
@@ -427,21 +509,22 @@ def cmd_land(a):
                 sys.exit(f"session: push to {base} failed:\n{err}")
             # someone landed in between: take their change and go again
             git(top, "fetch", "-q", "origin", base)
-            r = run(["git", "rebase", f"origin/{base}"], top, check=False)
-            if r.returncode:
-                files = git(top, "diff", "--name-only", "--diff-filter=U", check=False)
-                print("REBASE CONFLICT. Another session landed changes to the same lines:\n" + files)
-                print("\nResolve by meaning: keep both sessions' intents, never drop theirs to make yours apply.\n"
-                      "Then `git add <files>`, `git rebase --continue`, and run `python3 .agents/bin/session land` again.")
+            if not rebase_on_base(top, base, branch):
                 return 3
             if not portability_check(top):
                 sys.exit("session: portability check failed after the rebase; fix it and land again")
         else:
             sys.exit(f"session: origin/{base} kept moving; run `python3 .agents/bin/session land` again")
     print(f"Landing through a PR: {why_pr}")
+    # prune first: a branch GitHub deleted on an earlier merge leaves a stale origin/<branch> that
+    # makes --force-with-lease refuse the push
+    run(["git", "fetch", "-q", "--prune", "origin"], top, check=False)
+    head = git(top, "rev-parse", "HEAD")
     git(top, "push", "-q", "--force-with-lease", "-u", "origin", branch)
-    pr = run(["gh", "pr", "view", branch, *gh_repo(top), "--json", "url", "-q", ".url"], top, check=False)
-    if pr.returncode:
+    # an open PR only: `gh pr view <branch>` also returns the branch's merged PR from an earlier land
+    pr = run(["gh", "pr", "list", *gh_repo(top), "--head", branch, "--base", base, "--state", "open",
+              "--json", "url", "-q", ".[0].url // empty"], top, check=False)
+    if pr.returncode or not pr.stdout.strip():
         subjects = git(top, "log", "--reverse", "--format=%s", f"origin/{base}..HEAD").splitlines()
         title = a.title or next((x for x in subjects if not x.startswith("session: close")), branch)
         body = "Session branch landed under .agents/SESSIONS.md.\n\nChanged: " + ", ".join(f"`{c}`" for c in changed[:30])
@@ -458,12 +541,15 @@ def cmd_land(a):
     m = run(["gh", "pr", "merge", url, *gh_repo(top), "--squash", "--delete-branch", "--auto"], top, check=False)
     if m.returncode:
         m = run(["gh", "pr", "merge", url, *gh_repo(top), "--squash", "--delete-branch"], top, check=False)
-    info = run(["gh", "pr", "view", url, *gh_repo(top), "--json", "state,autoMergeRequest", "-q",
-                "[.state, (.autoMergeRequest != null)] | @tsv"], top, check=False).stdout.strip().split("\t")
-    state, armed = (info + ["", ""])[:2]
+    info = run(["gh", "pr", "view", url, *gh_repo(top), "--json", "state,autoMergeRequest,mergeCommit", "-q",
+                "[.state, (.autoMergeRequest != null), (.mergeCommit.oid // \"\")] | @tsv"], top, check=False).stdout.strip().split("\t")
+    state, armed, merged = (info + ["", "", ""])[:3]
     if state == "MERGED":
         print("PR merged.")
         ff_primary(primary, base)
+        if not (merged and follow(top, merged, head, base)):
+            print("branch still carries the merged commits (the squash is not this head's tree); "
+                  "the next land from this worktree skips them")
         print("Next: python3 .agents/bin/session finish")
     elif armed == "true":
         print("Auto-merge armed: the PR squash-merges by itself when its checks pass.\n"
@@ -487,10 +573,14 @@ def cmd_finish(a):
         wt = Path(cands[0]["path"])
     branch = git(wt, "branch", "--show-current")
     git(primary, "fetch", "-q", "--prune", "origin")
-    st = run(["gh", "pr", "view", branch, *gh_repo(wt), "--json", "state", "-q", ".state"], wt, check=False).stdout.strip()
+    st, pr_head = (run(["gh", "pr", "view", branch, *gh_repo(wt), "--json", "state,headRefOid", "-q",
+                        "[.state, .headRefOid] | @tsv"], wt, check=False).stdout.strip().split("\t") + ["", ""])[:2]
     mine = [x for x in git(wt, "diff", "--name-only", f"origin/{base}...HEAD", check=False).split("\n") if x]
     contained = not mine or not git(wt, "diff", "--name-only", "HEAD", f"origin/{base}", "--", *mine, check=False)
-    if st != "MERGED" and not contained:
+    # a merged PR counts only when it merged this head: commits made after an earlier landing have not landed
+    if not (st == "MERGED" and pr_head == git(wt, "rev-parse", "HEAD")) and not contained:
+        if st == "MERGED":
+            sys.exit(f"session: {branch} has commits after the head its merged PR carried; land them first")
         if st == "OPEN":
             sys.exit(f"session: the PR for {branch} is still open (checks running or awaiting a human); finish again once it merges")
         sys.exit(f"session: {branch} is not merged (PR state {st or 'none'}); land it first")
