@@ -14,8 +14,10 @@ it opens a PR only for ask paths, a base branch whose ruleset or protection requ
 status checks, or `--pr` (WS-DDR-143 amendment 2026-09-24).
 After a landing the session branch follows its squash, and a later `land` from the same worktree
 skips any commits that already landed, so it never replays them onto their own squash (kit 12).
+A file the branch untracks (`git rm --cached`) stays on disk through land's rebase: it is copied
+into the worktree's git dir first and put back after, and `finish` waits while a copy is left (kit 13).
 """
-import argparse, datetime as dt, fnmatch, json, os, re, shutil, subprocess, sys
+import argparse, datetime as dt, filecmp, fnmatch, json, os, re, shutil, subprocess, sys
 from pathlib import Path
 
 SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
@@ -210,11 +212,120 @@ def landed_boundary(top, base, branch):
     return None
 
 
+def kept_dir(top):
+    """Where land keeps a copy of each file the branch untracks while a rebase runs: this worktree's
+    own git dir, which no checkout, rebase or clean reaches. `git worktree remove` deletes it with
+    the worktree, so finish refuses while anything is left in it."""
+    return Path(git(top, "rev-parse", "--path-format=absolute", "--git-dir")) / "session-kept"
+
+
+def names(paths, n=8):
+    return ", ".join(paths[:n]) + (f" and {len(paths) - n} more" if len(paths) > n else "")
+
+
+def tree_paths(top, ref):
+    return set(run(["git", "ls-tree", "-r", "-z", "--name-only", ref], top, check=False).stdout.split("\0")) - {""}
+
+
+def keep_untracked(top, base, onto=None):
+    """Copy aside each file this branch untracks (`git rm --cached`) that is still on disk and that
+    the rebase target still tracks. The rebase checks the target out first, git overwrites an
+    ignored file there without asking, and replaying the untrack commit then deletes it: the loss
+    `git rm --cached` promises never happens (Subaru, 2026-09-24). Returns the paths kept."""
+    mb = git(top, "merge-base", "HEAD", f"origin/{base}", check=False)
+    if not mb:
+        return []
+    gone = run(["git", "diff", "--name-only", "-z", "--no-renames", "--diff-filter=D", mb, "HEAD"], top, check=False).stdout
+    on_disk = [p for p in gone.split("\0") if p and ((top / p).is_symlink() or (top / p).is_file())]
+    if not on_disk:
+        return []
+    tracked = set().union(*(tree_paths(top, ref) for ref in {f"origin/{base}", onto or f"origin/{base}"}))
+    kept = [p for p in on_disk if p in tracked]
+    kd = kept_dir(top)
+    clash = [p for p in kept if os.path.lexists(kd / p)]
+    if clash:
+        sys.exit(f"session: an earlier land still keeps a copy of {names(clash)} in {kd}, and this rebase would replace "
+                 "the file again. Merge the kept copy with the one in the worktree by hand, delete the kept copy, then land again")
+    for p in kept:
+        (kd / p).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(top / p, kd / p, follow_symlinks=False)
+    return kept
+
+
+def same(a, b):
+    if a.is_symlink() or b.is_symlink():
+        return a.is_symlink() and b.is_symlink() and os.readlink(a) == os.readlink(b)
+    return b.is_file() and filecmp.cmp(a, b, shallow=False)
+
+
+def restore_untracked(top):
+    """Put back what keep_untracked copied aside, only where nothing is lost: the path is untracked at
+    HEAD and holds nothing, or holds the same thing. Returns (restored, [(path, why) still kept]),
+    why being "tracked" (HEAD tracks the path) or "differs" (something wrote it after the rebase)."""
+    kd = kept_dir(top)
+    if not kd.is_dir():
+        return [], []
+    saved = []
+    for d, dirs, files in os.walk(kd):
+        saved += [Path(d) / x for x in files + [x for x in dirs if (Path(d) / x).is_symlink()]]
+    head = tree_paths(top, "HEAD") if saved else set()
+    restored, left = [], []
+    for src in sorted(saved):
+        rel = src.relative_to(kd).as_posix()
+        dst = top / rel
+        if rel in head:
+            left.append((rel, "tracked"))
+        elif not os.path.lexists(dst):
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.replace(src, dst)
+            except OSError:  # another filesystem
+                shutil.copy2(src, dst, follow_symlinks=False)
+                os.unlink(src)
+            restored.append(rel)
+        elif same(src, dst):
+            os.unlink(src)
+            restored.append(rel)
+        else:
+            left.append((rel, "differs"))
+    for d, _, _ in sorted(os.walk(kd), reverse=True):  # deepest first: drop the folders emptied
+        if not os.listdir(d):
+            os.rmdir(d)
+    return restored, left
+
+
+def put_back(top, kept=(), stopped=False):
+    """Restore the kept copies and say what happened. Returns the paths still kept."""
+    restored, left = restore_untracked(top)
+    kd = kept_dir(top) if left else None
+    now = [p for p in kept if p in restored]
+    if now:
+        print(f"kept {len(now)} file(s) this branch untracks through the rebase: {names(now)}")
+    earlier = [p for p in restored if p not in kept]
+    if earlier:
+        print(f"restored {names(earlier)}: an earlier land kept it aside during its rebase")
+    for rel, why in left:
+        if why == "tracked" and stopped:
+            print(f"kept aside until the rebase finishes: {rel} (copy at {kd / rel}); the next `session land` puts it back")
+        elif why == "tracked":
+            print(f"NOT restored: {rel} is tracked at HEAD again; the copy land kept is at {kd / rel}")
+        else:
+            print(f"NOT restored: {rel} was written again after the rebase, and neither copy is the kit's to discard; "
+                  f"the copy land kept is at {kd / rel}")
+    if left and not stopped:
+        print(f"Merge each by hand, then delete the kept copy; `session finish` waits until {kd} is empty.")
+    return [rel for rel, _ in left]
+
+
 def rebase_on_base(top, base, branch):
     """Rebase the session branch onto origin/<base>, first skipping commits that already landed.
-    Returns True, or reports the conflict and returns False (the rebase stays open to resolve)."""
+    Returns True, or reports the conflict and returns False (the rebase stays open to resolve).
+    Files the branch untracks are kept through it (keep_untracked); a rebase with nothing to do
+    touches no file, so they are copied only when origin/<base> moved or commits are skipped."""
     skipped = ""
     b = landed_boundary(top, base, branch)
+    moving = b or run(["git", "merge-base", "--is-ancestor", f"origin/{base}", "HEAD"], top, check=False).returncode
+    kept = keep_untracked(top, base, b[1] if b else None) if moving else []
     if b:
         c, onto, why = b
         n = git(top, "rev-list", "--count", f"origin/{base}..{c}")
@@ -226,6 +337,7 @@ def rebase_on_base(top, base, branch):
         mb = git(top, "merge-base", "HEAD", f"origin/{base}", check=False)
         r = run(["git", "rebase", f"origin/{base}"], top, check=False)
         if r.returncode == 0:
+            put_back(top, kept)
             return True
     else:
         mb = ""
@@ -241,6 +353,7 @@ def rebase_on_base(top, base, branch):
                   "of yours it carries>`, and land again.")
     print("\nResolve by meaning: keep both sessions' intents, never drop theirs to make yours apply.\n"
           "Then `git add <files>`, `git rebase --continue`, and run `python3 .agents/bin/session land` again.")
+    put_back(top, kept, stopped=True)
     return False
 
 
@@ -443,6 +556,7 @@ def cmd_land(a):
         sys.exit("session: commit or set aside your tracked changes first (never stash another session's work)")
     if os.path.exists(os.path.join(git(top, "rev-parse", "--git-dir"), "rebase-merge")):
         sys.exit("session: a rebase is in progress; resolve by meaning, `git add`, `git rebase --continue`, then land again")
+    put_back(top)  # what a land stopped by a conflict kept aside, now that its rebase has finished
     git(top, "fetch", "-q", "origin", base)
     activate_prepush(top)
     t = my_task(top, f"origin/{base}")
@@ -584,6 +698,10 @@ def cmd_finish(a):
         if st == "OPEN":
             sys.exit(f"session: the PR for {branch} is still open (checks running or awaiting a human); finish again once it merges")
         sys.exit(f"session: {branch} is not merged (PR state {st or 'none'}); land it first")
+    left = put_back(wt)
+    if left:
+        sys.exit(f"session: land kept {names(left)} aside in {kept_dir(wt)} and could not put it back; removing the "
+                 "worktree would delete that copy. Merge it by hand, delete the kept copy, then finish again")
     if git(wt, "status", "--porcelain"):
         sys.exit(f"session: {wt} has uncommitted changes; they are not yours to discard")
     ff_primary(primary, base)
