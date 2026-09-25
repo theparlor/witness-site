@@ -97,6 +97,16 @@ their own squash, and batches that touched the same lines conflicted with themse
 message that blamed another session. `finish` counts a merged PR as done only when it merged the
 branch's current head.
 
+A file your branch stops tracking (`git rm --cached`, usually with a `.gitignore` entry) stays on
+disk through `land`. Without help it would not: the rebase checks out a main that still tracks the
+file, git replaces an ignored file there without asking, and replaying your untrack commit then
+deletes it. So before rebasing, `land` copies each such file into this worktree's git dir
+(`session-kept/`, where no checkout, rebase or clean reaches) and puts it back afterwards. If a
+conflict stops the rebase first, the copy waits there and the next `land` restores it. A copy is
+never put over a file something has written since: `land` names both, and `finish` refuses to
+remove the worktree, which would delete the kept copy, until you have merged them by hand and
+deleted the kept one.
+
 ```bash
 python3 .agents/bin/session finish
 ```
