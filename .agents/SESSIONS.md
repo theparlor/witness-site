@@ -88,6 +88,15 @@ running) the primary lags until `finish` runs or the hub's primary-ff sweep pass
 says so. If the rebase hits a conflict it stops and lists
 the files: resolve them by meaning, `git add` them, `git rebase --continue`, run `land` again.
 
+After a landing your branch points at the commit that landed it (same files, so nothing in the
+worktree changes), and you can keep working in the same worktree and land again: the next `land`
+replays only the new commits. A branch that still carries commits that already landed (a PR that
+auto-merged after main moved, or a branch landed by a kit before version 12) has them skipped
+before the rebase, and `land` says how many. Without that skip, the old commits were replayed onto
+their own squash, and batches that touched the same lines conflicted with themselves under a
+message that blamed another session. `finish` counts a merged PR as done only when it merged the
+branch's current head.
+
 ```bash
 python3 .agents/bin/session finish
 ```
