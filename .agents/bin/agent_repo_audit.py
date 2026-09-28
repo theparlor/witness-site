@@ -3,8 +3,15 @@
 
 Generalized from the Subaru engagement's scripts/agent_repo_audit.py. Managed by
 org-design-tooling/repo-kit; overwritten on every kit update. Standard: .agents/SESSIONS.md.
+
+Read-only roots (external_read_only_roots in .agents/repository-policy.json) hold originals: filing
+a new one is the point, editing an existing one is never done. Three changes are not edits and pass
+(kit v16, 2026-09-28, purpose-oriented engagement folders): a byte-identical move that stays inside
+the same root (a rename with 100% similarity), a deletion whose bytes remain at another path under
+the same root (dropping an exact duplicate), and an edit to an index file (a basename listed in
+read_only_root_index_files, CONTEXT.md by default) at any depth under the root.
 """
-import argparse, fnmatch, json, subprocess, sys
+import argparse, fnmatch, json, os, subprocess, sys
 from pathlib import Path
 
 def git(root, *args, check=True):
@@ -18,6 +25,9 @@ LIVE = {"planned", "active", "review-ready", "blocked"}
 def match(path, pattern):
     return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path, pattern.removeprefix("**/"))
 
+def under(path, root):
+    return path == root or path.startswith(root + "/")
+
 def tasks():
     out = []
     legacy = ROOT / POLICY.get("task_registry", ".agents/tasks.json")
@@ -29,6 +39,14 @@ def tasks():
         for f in sorted(d.glob("*.json")):
             try: out.append(json.loads(f.read_text()))
             except Exception: pass
+    return out
+
+def head_blobs(root):
+    """Blob ids of every tracked path under a read-only root at HEAD."""
+    out = set()
+    for line in git(ROOT, "ls-tree", "-r", "HEAD", "--", root, check=False).splitlines():
+        meta = line.split("\t", 1)[0].split()
+        if len(meta) == 3: out.add(meta[2])
     return out
 
 def main():
@@ -44,11 +62,19 @@ def main():
     changed = [line[3:] for line in status if len(line) > 3]
     # paths whose existing content changed (modified, deleted, renamed); additions are not in here
     altered = {line[3:].split(" -> ")[0] for line in status if len(line) > 3 and line[:2].strip() and line[:2] not in ("??", "A ", "AM")}
+    moved, deleted = {}, set()   # committed renames old -> (new, similarity); committed deletions
     if a.against:
         changed = sorted(set(changed) | set(x for x in git(ROOT, "diff", "--name-only", f"{a.against}...HEAD", check=False).split("\n") if x))
         for line in git(ROOT, "diff", "--name-status", f"{a.against}...HEAD", check=False).splitlines():
             parts = line.split("\t")
-            if parts and parts[0][:1] in "MDRT" and len(parts) > 1:
+            if len(parts) < 2: continue
+            kind = parts[0][:1]
+            if kind == "R" and len(parts) > 2:
+                moved[parts[1]] = (parts[2], int(parts[0][1:] or 0))
+                altered.add(parts[1])
+            elif kind == "D":
+                deleted.add(parts[1]); altered.add(parts[1])
+            elif kind in "MT":
                 altered.add(parts[1])
     if a.path:
         changed = [x for x in changed if any(x == q.rstrip("/") or x.startswith(q.rstrip("/") + "/") for q in a.path)]
@@ -61,13 +87,27 @@ def main():
         diff_args = ["git", "diff", "--check"] + (["--", *a.path] if a.path else [])
         dc = subprocess.run(diff_args, cwd=ROOT, text=True, capture_output=True)
         if dc.returncode: errors.append("git diff --check failed: " + dc.stdout.strip()[:600])
+        index_names = set(POLICY.get("read_only_root_index_files", ["CONTEXT.md"]))
         for root in POLICY.get("external_read_only_roots", []):
             # filing a new original is the point of these roots; changing an existing one is not.
-            # The root's own index (CONTEXT.md, the Workspaces zero-orphaned-files rule) is not an
-            # original: filing anything requires editing it, so it is exempt from the immutability check.
-            index_files = {root + "/" + n for n in POLICY.get("read_only_root_index_files", ["CONTEXT.md"])}
-            hits = [x for x in altered if (x == root or x.startswith(root + "/")) and x not in index_files]
-            if hits: errors.append(f"external read-only paths modified, deleted or renamed under {root}: {', '.join(sorted(hits)[:8])}")
+            # An index (CONTEXT.md by default, at the root or at any depth under it) is not an original:
+            # filing anything requires editing it, so it is exempt. A byte-identical move inside the
+            # root and a deletion whose bytes remain elsewhere under the root are not edits either.
+            index_files = {root + "/" + n for n in index_names}
+            blobs = None
+            hits = []
+            for x in sorted(altered):
+                if not under(x, root): continue
+                if x in index_files or os.path.basename(x) in index_names: continue
+                if x in moved:
+                    new, sim = moved[x]
+                    if sim == 100 and under(new, root): continue
+                if x in deleted and a.against:
+                    if blobs is None: blobs = head_blobs(root)
+                    blob = git(ROOT, "rev-parse", "--verify", "--quiet", f"{a.against}:{x}", check=False).strip()
+                    if blob and blob in blobs: continue
+                hits.append(x)
+            if hits: errors.append(f"external read-only paths modified, deleted or renamed under {root}: {', '.join(hits[:8])}")
         for m in POLICY.get("generator_maps", []):
             output = any(match(x, pat) for x in changed for pat in m["outputs"])
             source = any(x in m["sources"] for x in changed)
