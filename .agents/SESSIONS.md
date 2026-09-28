@@ -118,15 +118,18 @@ clean) and deletes the local branch.
 python3 .agents/bin/agent_repo_audit.py --check
 ```
 
-Read-only checks: read-only roots untouched, generated output has its source, no session
+Read-only checks: read-only roots untouched (a byte-identical move that stays inside the root, a
+deletion whose bytes remain at another path under it, and an index file such as CONTEXT.md at any
+depth are not edits of an original; kit v16), generated output has its source, no session
 scratch paths in code, no two live tasks own the same path.
 
 ## Checks run on this machine, before the push
 
 `.agents/bin/portability-check` is the check GitHub Actions used to run on every push: the
 repo's own no-hardcoded-home test (`test_no_hardcoded_home.py` or `test-no-hardcoded-home.sh`,
-wherever it is tracked; pytest is not needed) and a syntax check of every tracked `*.sh` and
-`*.bash` by its shebang. Paths under `external_read_only_roots` and `portability_exclude` in
+wherever it is tracked; pytest is not needed; module-level `test_*` functions and
+`unittest.TestCase` classes both run, and a file that runs no test fails) and a syntax check
+of every tracked `*.sh` and `*.bash` by its shebang. Paths under `external_read_only_roots` and `portability_exclude` in
 `.agents/repository-policy.json` are skipped. It runs in three places:
 
 1. **Before every push**, as a git pre-push hook: `.agents/hooks/pre-push`, turned on per clone

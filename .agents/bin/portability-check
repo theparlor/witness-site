@@ -7,8 +7,9 @@
 
 Two parts, both over tracked files in the working tree:
 1. The repo's own no-hardcoded-home test(s): every tracked `test_no_hardcoded_home.py` (its
-   zero-argument `test_*` functions, called directly, so pytest need not be installed) and
-   every tracked `test-no-hardcoded-home.sh` (run with bash).
+   zero-argument module-level `test_*` functions, called directly, and its unittest.TestCase
+   classes, run by unittest, so pytest need not be installed; a file that runs no test at all
+   fails) and every tracked `test-no-hardcoded-home.sh` (run with bash).
 2. A syntax check of every tracked `*.sh` and `*.bash` file by its shebang: a file whose first
    line names python is compiled as Python (some .sh files are Python), any other with `bash -n`.
 
@@ -27,7 +28,7 @@ TESTS_SH = "test-no-hardcoded-home.sh"
 ZERO = "0" * 40
 
 RUNNER = r"""
-import importlib.util, inspect, sys, traceback
+import importlib.util, inspect, sys, traceback, unittest
 path = sys.argv[1]
 sys.path.insert(0, __import__("os").path.dirname(path))
 spec = importlib.util.spec_from_file_location("portability_home_test", path)
@@ -49,7 +50,16 @@ for name, fn in list(vars(mod).items()):
         fails += 1; print(f"FAIL {name}\n{e}")
     except Exception:
         fails += 1; print(f"ERROR {name}\n{traceback.format_exc(limit=3)}")
+suite = unittest.defaultTestLoader.loadTestsFromModule(mod)  # unittest.TestCase classes, as unittest runs them
+if suite.countTestCases():
+    res = unittest.TextTestRunner(stream=sys.stdout, verbosity=2).run(suite)
+    ran += res.testsRun
+    fails += len(res.failures) + len(res.errors) + len(res.unexpectedSuccesses)
 print(f"ran {ran} test(s), {fails} failed")
+if not ran and not fails:
+    print("a home-path test file that runs no test proves nothing: give it a test_* function or a "
+          "unittest.TestCase with a test_* method")
+    sys.exit(1)
 sys.exit(1 if fails else 0)
 """
 
