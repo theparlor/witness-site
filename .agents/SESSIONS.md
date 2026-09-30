@@ -55,7 +55,12 @@ runs the checks on the machine, and lands as one squashed commit on main.
 
 ## The commands
 
-Run from anywhere inside the repo: the primary checkout or any worktree.
+Run from inside the repo: the primary checkout or any of its worktrees. The repo is the one the script
+lives in (the parent of `.agents/`), never merely the one the shell is standing in. A shell in a
+different repository gets one line naming both, exit status 2, and nothing changes: `cd` into the repo
+and run it again, or pass `--here` to act on the repository the shell is in (`start --here` also adopts
+the worktree, rule 2). A shell in no repository uses the script's own. Each run reports one event to
+Witness when Witness is on the machine (WS-DDR-150); a missing or failing Witness changes nothing.
 
 ```bash
 python3 .agents/bin/session start <task> --own <path> --objective "<one line>"
