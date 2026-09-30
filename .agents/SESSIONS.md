@@ -83,8 +83,9 @@ python3 .agents/bin/session land
 
 Run inside your worktree once your work is committed. It closes your task file (folded into
 your last commit when that commit has not been pushed yet, so there is no separate
-`session: close` commit to pay CI for), rebases onto `origin/main`, runs the audit and the
-portability check, then lands: by default as one squashed commit pushed straight to main
+`session: close` commit to pay CI for), rebases onto `origin/main`, runs the audit, the
+repository's own pre-land commands (if it declares any) and the portability check, then lands:
+by default as one squashed commit pushed straight to main
 (retrying the rebase if another session landed in between), and through a PR where rule 6
 says so, squash-merging it or leaving it open for a human when it touches an ask path.
 `--pr` forces a PR; `--no-merge` opens one and leaves it. When the landing completes in line,
@@ -148,6 +149,41 @@ of every tracked `*.sh` and `*.bash` by its shebang. Paths under `external_read_
    newer run on the same ref cancels the older one. A hand-customized workflow is left alone.
 
 Fix a failure here; do not push around it.
+
+### The repository's own pre-land commands (kit 18)
+
+A repository can name commands that must pass before anything reaches its main branch: a list
+under `pre_land` in `.agents/repository-policy.json`, each entry
+`{"name": "...", "run": ["{python}", "path/to/check.py"], "timeout_s": 300}`. `{python}` is the
+interpreter running `session`; a relative path is relative to the worktree. `session land` runs
+them in the session worktree, in order, on the tree that would land: after the rebase onto
+`origin/main` and the audit, before the portability check and the push, and again whenever
+another session lands first and the land rebases a second time. A command that exits non-zero,
+or outlives its timeout (it is killed with its whole process group), stops the land with exit
+status 1: nothing is pushed, and the branch and the worktree stay as they were. The last 40
+lines of its output are shown either way. A policy file that does not parse, or an entry with
+no name, no `run` list or a timeout outside 1 to 1800 seconds, stops the land too, so a broken
+declaration never turns the gate off without a word. The default is none (`"pre_land": []`).
+
+Keep them fast and local: they run on every land of every session. Cast's is its
+`gate`-marked tests (`engine/scripts/gate_tests.py`, under a minute, no model call, no
+network), added after a test encoding a pipeline invariant stayed red on every branch for
+four days in September 2026.
+
+### A land never reverts another session's landing (kit 19)
+
+Every worktree of a repository shares `refs/remotes/origin/main`, and each session's `git push`
+moves it. Through kit 18, `land` rebased onto `origin/main`, ran its checks (about a minute with
+a pre-land gate), then built the squash with `origin/main` read again as its parent. When a
+sibling session landed in that minute, its landing became the parent while the tree was still
+the older base plus this branch: the push was a fast-forward, the retry never ran, and main lost
+the sibling's files (Cast e2bcc5811, 466d01305, 51487a026 and 7f6dfcbaf, 30 September 2026).
+
+Now `land` reads `origin/main` once, rebases onto that commit and builds the squash on that
+same commit. If main moved meanwhile, the push is refused as non-fast-forward and the land
+fetches, rebases and runs the checks again. A guard also refuses, before the push, any squash
+that changes a path none of the branch's own commits touched: that can only be another
+session's landing being undone. Nothing is pushed; land again.
 
 ## What the hooks enforce
 
