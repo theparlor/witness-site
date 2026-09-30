@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """Parallel-session helper for this repo. Standard: .agents/SESSIONS.md. Stdlib only.
 
-  session start <task> [--own PATH]... [--provider P] [--objective TEXT]
-  session status [--json]
-  session land [--title T] [--pr] [--no-merge] [--local]
-  session finish [--task TASK]
+  session start <task> [--own PATH]... [--provider P] [--objective TEXT] [--here]
+  session status [--json] [--here]
+  session land [--title T] [--pr] [--no-merge] [--local] [--here]
+  session finish [--task TASK] [--here]
 
 Managed by org-design-tooling/repo-kit; overwritten on every kit update.
+The repository is the one this script lives in (the parent of .agents/), not the one the shell happens
+to be in (kit 17): a lane that ran one repo's script from another repo's folder used to cut its worktree
+in the wrong repo, silently. From a shell in a different repository every command refuses in one line
+naming both, exits 2 and changes nothing; --here says the shell's repository is the one meant. From a
+shell in no repository the script's own repository is used. Inside the script's repository the shell's
+own worktree is the one acted on, so the primary's copy of the script can drive any session worktree.
+Each run reports one event to Witness when Witness is on the machine, fail-open (WS-DDR-150, kit 17).
 `start` and `land` turn on the pre-push portability check for this clone (activate_prepush);
 `land` runs the same check itself before it pushes.
 `land` lands locally by default (squash onto origin/<base>, fast-forward push, no GitHub run);
@@ -17,11 +24,31 @@ skips any commits that already landed, so it never replays them onto their own s
 A file the branch untracks (`git rm --cached`) stays on disk through land's rebase: it is copied
 into the worktree's git dir first and put back after, and `finish` waits while a copy is left (kit 13).
 """
-import argparse, datetime as dt, filecmp, fnmatch, json, os, re, shutil, subprocess, sys
+import argparse, contextlib, datetime as dt, filecmp, fnmatch, importlib.util, io, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 
 SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
 FOOTER = "\n\n\U0001F916 Generated with [Claude Code](https://claude.com/claude-code)"
+WRONG_REPO = 2  # exit status of a refusal: the shell is standing in a repository this script does not belong to
+
+
+def _kit_dir():
+    """The checkout this script is installed in: <checkout>/.agents/bin/session. None for a copy anywhere else."""
+    p = Path(__file__).resolve()
+    return p.parents[2] if p.parent.name == "bin" and p.parent.parent.name == ".agents" and len(p.parts) > 3 else None
+
+
+KIT_DIR = _kit_dir()
+
+
+def _kit_version():
+    try:
+        return (KIT_DIR / ".agents" / "KIT_VERSION").read_text().strip()
+    except Exception:
+        return "unknown"
+
+
+KIT_VERSION = _kit_version()  # read once: `finish` removes the worktree this script lives in before the event is sent
 
 
 def run(args, cwd, check=True):
@@ -43,14 +70,110 @@ def commit(cwd, provider, *a):
         sys.exit(f"session: commit failed in {cwd}:\n{(r.stderr or r.stdout).strip()}")
 
 
-def here():
-    top = run(["git", "rev-parse", "--show-toplevel"], os.getcwd(), check=False)
-    if top.returncode:
+def repo_of(path):
+    """(top, primary, common) of the git work tree that holds `path`, or None when it is in none.
+
+    top is that work tree's root, primary the repository's own checkout (the parent of the common git
+    dir, the same for every worktree of it), common the common git dir with symlinks resolved: two
+    paths are one repository exactly when their common dirs are equal."""
+    if path is None:
+        return None
+    r = run(["git", "rev-parse", "--show-toplevel", "--path-format=absolute", "--git-common-dir"], path, check=False)
+    lines = r.stdout.splitlines()
+    if r.returncode or len(lines) < 2 or not lines[0].strip() or not lines[1].strip():
+        return None
+    common = Path(lines[1].strip())
+    return Path(lines[0].strip()), common.parent, common.resolve()
+
+
+# What this run reports to Witness (WS-DDR-150): the repo it acted on, counts and a reason, never content.
+EVENT = {"verb": None, "target": None, "confidential": False, "attrs": {}}
+
+
+def acted_on(primary):
+    EVENT["target"] = primary.name
+    EVENT["confidential"] = "Work" in primary.parts  # engagement repos: events carry the client-confidential tag
+
+
+def here(allow_other=False):
+    """(top, primary, linked): the checkout this command acts on, the repository's primary checkout, and
+    whether top is a linked worktree.
+
+    The repository is the one this script lives in (the parent of .agents/), never merely the one the shell
+    happens to be standing in: on 2026-09-28 two lanes ran Cast's script from the Workspaces root, and each
+    cut its worktree and branch in the governance repo without a word. Inside the script's own repository
+    the shell's worktree is the one acted on, so the primary's copy of the script can drive a session
+    worktree (Cortege does) and the reverse. A shell in a different repository is refused, in one line naming
+    both, exit status 2, nothing touched; allow_other (--here) says the shell's repository is the one meant.
+    A shell in no repository, or in a directory since removed, falls back to the script's own checkout."""
+    own = repo_of(KIT_DIR)
+    try:
+        cwd = repo_of(Path.cwd())
+    except OSError:  # the shell's directory is gone (finish removes the worktree it stood in)
+        cwd = None
+    if own and cwd and own[2] != cwd[2] and not allow_other:
+        acted_on(own[1])
+        EVENT["attrs"].update(reason="wrong_repo", shell_repo=cwd[1].name)
+        print(f"session: this script belongs to the repository at {own[0]}, but the shell is in {cwd[0]}, a different "
+              f"repository; run it from {own[0]} (a subshell leaves this shell where it is: (cd {own[0]} && python3 "
+              f".agents/bin/session {EVENT.get('verb') or '<command>'} ...)), or pass --here to act on the repository the shell is in",
+              file=sys.stderr)
+        sys.exit(WRONG_REPO)
+    found = cwd or own
+    if not found:
         sys.exit("session: not inside a git repository")
-    top = Path(top.stdout.strip())
-    common = Path(git(top, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    primary = common.parent
+    top, primary, _ = found
+    acted_on(primary)
     return top, primary, top.resolve() != primary.resolve()
+
+
+def witness_emit():
+    """Witness's shared emit call, found the way org-design-tooling/src/witness_bridge.py finds it:
+    $WITNESS_ROOT/src, the Core/ folder above this file, then ~/Workspaces/Core. None when Witness is not here."""
+    roots = []
+    if os.environ.get("WITNESS_ROOT"):
+        roots.append(Path(os.environ["WITNESS_ROOT"]) / "src")
+    for parent in Path(__file__).resolve().parents:
+        if parent.name == "Core":
+            roots.append(parent / "products" / "witness" / "src")
+            break
+    roots.append(Path.home() / "Workspaces" / "Core" / "products" / "witness" / "src")
+    for src in roots:
+        if (src / "emit.py").is_file():
+            spec = importlib.util.spec_from_file_location("witness_shared_emit", src / "emit.py")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod.emit
+    return None
+
+
+def witness_report(cmd, code, started):
+    """One event per run to Witness (WS-DDR-150): the verb, the repo, counts, a duration, never content.
+
+    Fail-open by construction: Witness missing, a broken emit or a full disk leaves this command's output
+    and exit status exactly as they were. Under pytest with no explicit WITNESS_INBOX nothing is written,
+    so a test run never posts to the real inbox."""
+    try:
+        if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("WITNESS_INBOX"):
+            return
+        emit = witness_emit()
+        if emit is None:
+            return
+        if code in (0, None):
+            outcome = "ok"
+        elif isinstance(code, int) and (code == 3 or EVENT["attrs"].get("reason") == "wrong_repo"):
+            outcome = "blocked"  # stopped for a person: a rebase conflict, or a shell in the wrong repository
+        elif cmd == "status" and code == 1:
+            outcome = "ok"  # overlaps found: a finding, not a failure
+        else:
+            outcome = "error"
+        extra = {"redaction_level": "client-confidential"} if EVENT["confidential"] else {}
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            emit("org-design-tooling", "org_design_tooling.session_kit", outcome=outcome,
+                 duration_ms=(time.monotonic() - started) * 1000.0, target=EVENT["target"],
+                 verb=cmd, kit_version=KIT_VERSION, **EVENT["attrs"], **extra)
+    except (Exception, SystemExit):  # an emit that calls sys.exit must not end this command either
+        pass
 
 
 def default_branch(repo):
@@ -363,7 +486,8 @@ def pushed(top, rev="HEAD"):
 
 
 def cmd_start(a):
-    top, primary, linked = here()
+    top, primary, linked = here(a.here)
+    EVENT["attrs"].update(adopt=bool(a.here), linked=linked)
     if not SLUG.match(a.task):
         sys.exit("session: task must be a short slug of letters, digits, dot, dash, underscore")
     today = dt.date.today().isoformat()
@@ -493,11 +617,12 @@ def overlaps(ss):
 
 
 def cmd_status(a):
-    _, primary, _ = here()
+    _, primary, _ = here(a.here)
     base = default_branch(primary)
     run(["git", "fetch", "-q", "origin", base], primary, check=False)
     ss = sessions(primary)
     ov = overlaps(ss)
+    EVENT["attrs"].update(sessions=len(ss), overlaps=len(ov))
     pbranch = git(primary, "branch", "--show-current", check=False) or "(detached)"
     pdirty = len(git(primary, "status", "--porcelain", check=False).splitlines())
     pbehind = primary_behind(primary, base)
@@ -571,7 +696,7 @@ def land_message(top, base, title, branch):
 
 
 def cmd_land(a):
-    top, primary, linked = here()
+    top, primary, linked = here(a.here)
     if not linked:
         sys.exit("session: land runs inside a session worktree, not the primary checkout")
     base = default_branch(primary)
@@ -619,6 +744,7 @@ def cmd_land(a):
     if not portability_check(top):
         sys.exit("session: portability check failed (the check CI used to run on every push); fix it and land again")
     changed = name_list(top, "--no-renames", f"origin/{base}...HEAD")
+    EVENT["attrs"]["files"] = len(changed)
     # Local landing is the default (WS-DDR-143 amendment 2026-09-24): the checks already ran here,
     # so a PR would only buy a second, billed run of them. A PR is used for ask paths (a human
     # decides), for a base branch that requires one, or when asked for with --pr or --no-merge.
@@ -632,6 +758,7 @@ def cmd_land(a):
             squash = git(top, "commit-tree", f"{head}^{{tree}}", "-p", f"origin/{base}", "-m", land_message(top, base, a.title, branch))
             p = run(["git", "push", "-q", "origin", f"{squash}:refs/heads/{base}"], top, check=False)
             if p.returncode == 0:
+                EVENT["attrs"]["route"] = "local"
                 print(f"landed locally as {squash[:8]} on origin/{base} (no PR, no CI run)")
                 # the branch follows its squash (same tree): a later land replays only what is new
                 follow(top, squash, head, base)
@@ -652,6 +779,7 @@ def cmd_land(a):
                 sys.exit("session: portability check failed after the rebase; fix it and land again")
         else:
             sys.exit(f"session: origin/{base} kept moving; run `python3 .agents/bin/session land` again")
+    EVENT["attrs"]["route"] = "pr"
     print(f"Landing through a PR: {why_pr}")
     # prune first: a branch GitHub deleted on an earlier merge leaves a stale origin/<branch> that
     # makes --force-with-lease refuse the push
@@ -699,7 +827,7 @@ def cmd_land(a):
 
 
 def cmd_finish(a):
-    top, primary, linked = here()
+    top, primary, linked = here(a.here)
     base = default_branch(primary)
     if linked:
         wt = top
@@ -741,17 +869,30 @@ def cmd_finish(a):
 def main():
     p = argparse.ArgumentParser(prog="session", description="Parallel sessions: see .agents/SESSIONS.md")
     sub = p.add_subparsers(dest="cmd", required=True)
+    other = "act on the repository the shell is in even though this script belongs to another one (kit 17)"
     s = sub.add_parser("start"); s.add_argument("task"); s.add_argument("--own", action="append", default=[])
     s.add_argument("--provider"); s.add_argument("--objective")
-    s.add_argument("--here", action="store_true", help="adopt the session worktree you are in (the desktop app's .claude/worktrees/<name>) instead of cutting a sibling")
+    s.add_argument("--here", action="store_true", help="adopt the session worktree you are in (the desktop app's .claude/worktrees/<name>) instead of cutting a sibling; the repository it belongs to is the one meant, even if this script belongs to another")
     s = sub.add_parser("status"); s.add_argument("--json", action="store_true")
+    s.add_argument("--here", action="store_true", help=other)
     s = sub.add_parser("land"); s.add_argument("--title")
     s.add_argument("--pr", action="store_true", help="land through a pull request even where local landing is allowed")
     s.add_argument("--no-merge", action="store_true", help="open the PR and leave it for a human")
     s.add_argument("--local", action="store_true", help="land locally even for ask paths (skips the ruleset lookup)")
+    s.add_argument("--here", action="store_true", help=other)
     s = sub.add_parser("finish"); s.add_argument("--task")
+    s.add_argument("--here", action="store_true", help=other)
     a = p.parse_args()
-    return {"start": cmd_start, "status": cmd_status, "land": cmd_land, "finish": cmd_finish}[a.cmd](a) or 0
+    started, code = time.monotonic(), "uncaught exception"
+    EVENT["verb"] = a.cmd
+    try:
+        code = {"start": cmd_start, "status": cmd_status, "land": cmd_land, "finish": cmd_finish}[a.cmd](a) or 0
+        return code
+    except SystemExit as e:
+        code = e.code
+        raise
+    finally:
+        witness_report(a.cmd, code, started)
 
 
 if __name__ == "__main__":
