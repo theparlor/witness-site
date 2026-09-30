@@ -16,6 +16,8 @@ own worktree is the one acted on, so the primary's copy of the script can drive 
 Each run reports one event to Witness when Witness is on the machine, fail-open (WS-DDR-150, kit 17).
 `start` and `land` turn on the pre-push portability check for this clone (activate_prepush);
 `land` runs the same check itself before it pushes.
+Before it pushes, `land` also runs the repository's own pre-land commands, declared under `pre_land` in
+.agents/repository-policy.json, on the rebased tree; one that fails stops the land (kit 18).
 `land` lands locally by default (squash onto origin/<base>, fast-forward push, no GitHub run);
 it opens a PR only for ask paths, a base branch whose ruleset or protection requires a PR or
 status checks, or `--pr` (WS-DDR-143 amendment 2026-09-24).
@@ -24,7 +26,7 @@ skips any commits that already landed, so it never replays them onto their own s
 A file the branch untracks (`git rm --cached`) stays on disk through land's rebase: it is copied
 into the worktree's git dir first and put back after, and `finish` waits while a copy is left (kit 13).
 """
-import argparse, contextlib, datetime as dt, filecmp, fnmatch, importlib.util, io, json, os, re, shutil, subprocess, sys, time
+import argparse, contextlib, datetime as dt, filecmp, fnmatch, importlib.util, io, json, os, re, shutil, signal, subprocess, sys, time
 from pathlib import Path
 
 SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$")
@@ -274,6 +276,87 @@ def activate_prepush(repo):
     shim.chmod(0o755)
 
 
+PRE_LAND_TIMEOUT = 300       # seconds, for an entry that names none
+PRE_LAND_TIMEOUT_MAX = 1800  # a land is not a place for a long suite
+PRE_LAND_TAIL = 40           # lines of a command's output the land shows
+
+
+def pre_land_commands(top):
+    """The repository's own pre-land commands (kit 18): the list under "pre_land" in the worktree's
+    .agents/repository-policy.json, each {"name": str, "run": [argument, ...], "timeout_s": seconds}.
+    `{python}` in run is the interpreter running this script; a relative path is relative to the worktree.
+    Returns [(name, argv, timeout)], [] when none are declared.
+
+    Fails closed, exit status 1: a policy file that does not parse, or an entry without a name, a non-empty
+    list of string arguments and a timeout between 1 and PRE_LAND_TIMEOUT_MAX seconds, stops the land. It is
+    read here and not through policy(), which reads an unreadable file as no policy: for a gate, that would
+    turn the gate off without a word (Cast pipeline gap closure, AUD-30, 2026-09-30)."""
+    p = top / ".agents" / "repository-policy.json"
+    if not p.is_file():
+        return []
+    try:
+        pol = json.loads(p.read_text())
+    except ValueError as e:
+        EVENT["attrs"]["reason"] = "pre_land"
+        sys.exit(f"session: .agents/repository-policy.json does not parse ({e}), so its pre_land gate cannot be "
+                 "read; fix the file and land again")
+    raw = pol.get("pre_land", []) if isinstance(pol, dict) else None
+    if not isinstance(raw, list):
+        EVENT["attrs"]["reason"] = "pre_land"
+        sys.exit("session: pre_land in .agents/repository-policy.json must be a list of commands; fix it and land again")
+    out = []
+    for i, e in enumerate(raw):
+        e = e if isinstance(e, dict) else {}
+        name, argv, limit = e.get("name"), e.get("run"), e.get("timeout_s", PRE_LAND_TIMEOUT)
+        ok = (isinstance(name, str) and name.strip() and isinstance(argv, list) and argv
+              and all(isinstance(x, str) and x for x in argv)
+              and isinstance(limit, (int, float)) and not isinstance(limit, bool) and 1 <= limit <= PRE_LAND_TIMEOUT_MAX)
+        if not ok:
+            label = name.strip() if isinstance(name, str) and name.strip() else f"entry {i + 1}"
+            EVENT["attrs"].update(reason="pre_land", pre_land=label[:80])
+            sys.exit(f"session: pre_land {label!r} in .agents/repository-policy.json needs a name, a non-empty \"run\" "
+                     f"list of arguments and a timeout_s from 1 to {PRE_LAND_TIMEOUT_MAX} seconds; fix the declaration "
+                     "and land again")
+        out.append((name.strip(), [sys.executable if x == "{python}" else x for x in argv], float(limit)))
+    return out
+
+
+def run_pre_land(top, commands):
+    """Run each pre-land command in the worktree, in order, and stop the land (exit status 1, never 3, which
+    callers read as a rebase conflict) at the first that exits non-zero or outlives its timeout. The last
+    PRE_LAND_TAIL lines of its output are shown whichever way it ends. A command that times out is killed
+    with its whole process group, so a test runner's children do not outlive the land."""
+    for name, argv, limit in commands:
+        started = time.monotonic()
+        try:
+            proc = subprocess.Popen(argv, cwd=top, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    env=dict(os.environ, SESSION_PRE_LAND=name), start_new_session=True)
+        except OSError as e:
+            EVENT["attrs"].update(reason="pre_land", pre_land=name[:80])
+            sys.exit(f"session: pre-land check {name!r} failed (it could not start: {e}); fix it and land again")
+        try:
+            output, _ = proc.communicate(timeout=limit)
+            why = f"exit {proc.returncode}"
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
+            output, _ = proc.communicate()
+            why = f"timed out after {limit:g} s"
+        lines = (output or "").strip().splitlines()
+        if lines:
+            print(f"pre-land check {name!r}:" + ("" if len(lines) <= PRE_LAND_TAIL else f" (last {PRE_LAND_TAIL} lines)"))
+            print("\n".join("  " + x for x in lines[-PRE_LAND_TAIL:]))
+        if why == "exit 0":
+            print(f"pre-land check {name!r} passed ({time.monotonic() - started:.1f} s)")
+            EVENT["attrs"]["pre_land_passed"] = EVENT["attrs"].get("pre_land_passed", 0) + 1
+            continue
+        EVENT["attrs"].update(reason="pre_land", pre_land=name[:80])
+        sys.exit(f"session: pre-land check {name!r} failed ({why}); fix it and land again (the repository's own "
+                 "gate, declared under pre_land in .agents/repository-policy.json)")
+
+
 def portability_check(top):
     """The pre-push check, run by land before it pushes. Returns True when it passes or is absent."""
     chk = top / ".agents" / "bin" / "portability-check"
@@ -304,7 +387,7 @@ def has_gh():
     return shutil.which("gh") is not None
 
 
-def landed_boundary(top, base, branch):
+def landed_boundary(top, base, branch, up=None):
     """Where an earlier landing from this branch ends: (newest landed commit of ours, rebase target,
     why) or None. Kit 11 and earlier left the branch on its unsquashed commits after a landing, and
     an auto-merged PR still does; rebasing those onto origin/<base> replays them onto their own
@@ -313,11 +396,12 @@ def landed_boundary(top, base, branch):
     A local landing's squash has the tree of the branch head it landed, so a commit on origin/<base>
     with the same tree as one of ours marks it. A PR that GitHub squashed after origin/<base> moved
     has a tree of its own; for a branch that was pushed for a PR, GitHub says which head it merged."""
-    mine = [l.split() for l in git(top, "log", "--format=%H %T", f"origin/{base}..HEAD", check=False).splitlines()]
+    up = up or f"origin/{base}"
+    mine = [l.split() for l in git(top, "log", "--format=%H %T", f"{up}..HEAD", check=False).splitlines()]
     if not mine:
         return None
     landed = {}
-    for h, t in (l.split() for l in git(top, "log", "--reverse", "--format=%H %T", f"HEAD..origin/{base}", check=False).splitlines()):
+    for h, t in (l.split() for l in git(top, "log", "--reverse", "--format=%H %T", f"HEAD..{up}", check=False).splitlines()):
         landed.setdefault(t, h)
     for h, t in mine:  # newest first
         if t in landed:
@@ -331,7 +415,7 @@ def landed_boundary(top, base, branch):
             heads = {}
         for h, _ in mine:
             if h in heads:
-                return h, f"origin/{base}", f"PR #{heads[h]} merged it"
+                return h, up, f"PR #{heads[h]} merged it"
     return None
 
 
@@ -350,19 +434,20 @@ def tree_paths(top, ref):
     return set(run(["git", "ls-tree", "-r", "-z", "--name-only", ref], top, check=False).stdout.split("\0")) - {""}
 
 
-def keep_untracked(top, base, onto=None):
+def keep_untracked(top, base, onto=None, up=None):
     """Copy aside each file this branch untracks (`git rm --cached`) that is still on disk and that
     the rebase target still tracks. The rebase checks the target out first, git overwrites an
     ignored file there without asking, and replaying the untrack commit then deletes it: the loss
     `git rm --cached` promises never happens (Subaru, 2026-09-24). Returns the paths kept."""
-    mb = git(top, "merge-base", "HEAD", f"origin/{base}", check=False)
+    up = up or f"origin/{base}"
+    mb = git(top, "merge-base", "HEAD", up, check=False)
     if not mb:
         return []
     gone = run(["git", "diff", "--name-only", "-z", "--no-renames", "--diff-filter=D", mb, "HEAD"], top, check=False).stdout
     on_disk = [p for p in gone.split("\0") if p and ((top / p).is_symlink() or (top / p).is_file())]
     if not on_disk:
         return []
-    tracked = set().union(*(tree_paths(top, ref) for ref in {f"origin/{base}", onto or f"origin/{base}"}))
+    tracked = set().union(*(tree_paths(top, ref) for ref in {up, onto or up}))
     kept = [p for p in on_disk if p in tracked]
     kd = kept_dir(top)
     clash = [p for p in kept if os.path.lexists(kd / p)]
@@ -442,26 +527,33 @@ def put_back(top, kept=(), stopped=False):
 
 def rebase_on_base(top, base, branch):
     """Rebase the session branch onto origin/<base>, first skipping commits that already landed.
-    Returns True, or reports the conflict and returns False (the rebase stays open to resolve).
-    Files the branch untracks are kept through it (keep_untracked); a rebase with nothing to do
-    touches no file, so they are copied only when origin/<base> moved or commits are skipped."""
+    Returns the commit it rebased onto (a sha, truthy), or reports the conflict and returns "" (the
+    rebase stays open to resolve). Files the branch untracks are kept through it (keep_untracked); a
+    rebase with nothing to do touches no file, so they are copied only when origin/<base> moved or
+    commits are skipped.
+
+    Kit 19: origin/<base> is read ONCE, here, and the rebase goes onto that commit. Every worktree of a
+    repository shares refs/remotes/origin/<base>, and a sibling session's `git push` moves it; the land
+    must build its squash on the commit this branch was rebased onto, never on whatever the shared ref
+    names later (Cast e2bcc5811 and 466d01305, 2026-09-30, reverted two sessions' landings that way)."""
     skipped = ""
-    b = landed_boundary(top, base, branch)
-    moving = b or run(["git", "merge-base", "--is-ancestor", f"origin/{base}", "HEAD"], top, check=False).returncode
-    kept = keep_untracked(top, base, b[1] if b else None) if moving else []
+    pin = git(top, "rev-parse", "--verify", f"origin/{base}^{{commit}}")
+    b = landed_boundary(top, base, branch, up=pin)
+    moving = b or run(["git", "merge-base", "--is-ancestor", pin, "HEAD"], top, check=False).returncode
+    kept = keep_untracked(top, base, b[1] if b else None, up=pin) if moving else []
     if b:
         c, onto, why = b
-        n = git(top, "rev-list", "--count", f"origin/{base}..{c}")
+        n = git(top, "rev-list", "--count", f"{pin}..{c}")
         rest = git(top, "rev-list", "--count", f"{c}..HEAD")
         skipped = f"{n} commit(s) on this branch already landed ({why})"
         print(f"{skipped}; replaying only the {rest} after them")
         r = run(["git", "rebase", "--onto", onto, c], top, check=False)
     if not b or r.returncode == 0:
-        mb = git(top, "merge-base", "HEAD", f"origin/{base}", check=False)
-        r = run(["git", "rebase", f"origin/{base}"], top, check=False)
+        mb = git(top, "merge-base", "HEAD", pin, check=False)
+        r = run(["git", "rebase", pin], top, check=False)
         if r.returncode == 0:
             put_back(top, kept)
-            return True
+            return pin
     else:
         mb = ""
     files = git(top, "diff", "--name-only", "--diff-filter=U", check=False)
@@ -477,7 +569,7 @@ def rebase_on_base(top, base, branch):
     print("\nResolve by meaning: keep both sessions' intents, never drop theirs to make yours apply.\n"
           "Then `git add <files>`, `git rebase --continue`, and run `python3 .agents/bin/session land` again.")
     put_back(top, kept, stopped=True)
-    return False
+    return ""
 
 
 def pushed(top, rev="HEAD"):
@@ -680,19 +772,30 @@ def requires_pr(top, base):
     return ""
 
 
-def land_message(top, base, title, branch):
+def land_message(top, base, title, branch, since=None):
     """Squash message for a local landing: the session's subject, each commit's subject, and the
     commits' trailers (Co-Authored-By and the like) carried over once each."""
-    subjects = [x for x in git(top, "log", "--reverse", "--format=%s", f"origin/{base}..HEAD").splitlines()
+    since = since or f"origin/{base}"
+    subjects = [x for x in git(top, "log", "--reverse", "--format=%s", f"{since}..HEAD").splitlines()
                 if not x.startswith("session: close")]
     subject = title or (subjects[0] if subjects else f"{branch}: land")
     trailers = []
-    for l in git(top, "log", "--reverse", "--format=%(trailers:only,unfold)", f"origin/{base}..HEAD").splitlines():
+    for l in git(top, "log", "--reverse", "--format=%(trailers:only,unfold)", f"{since}..HEAD").splitlines():
         if l.strip() and l not in trailers:
             trailers.append(l)
     body = "\n".join(f"- {x}" for x in subjects) if len(subjects) > 1 else ""
     note = f"Landed locally by session land from {branch} (WS-DDR-143 amendment 2026-09-24)."
     return "\n\n".join(x for x in (subject, body, note, "\n".join(trailers)) if x)
+
+
+def foreign_paths(top, squash, parent, own_base, head="HEAD"):
+    """Paths the squash changes against the commit it lands on that none of the branch's own commits
+    (own_base..head) touched. A correct squash has none: its tree is the branch rebased onto parent.
+    Anything listed would be a silent revert of another session's landing (kit 19)."""
+    landing = set(name_list(top, "--no-renames", parent, squash))
+    own = set(x for x in run(["git", "log", "--no-renames", "-m", "--name-only", "-z", "--format=", f"{own_base}..{head}"],
+                             top, check=False).stdout.replace("\n", "\0").split("\0") if x)
+    return sorted(landing - own)
 
 
 def cmd_land(a):
@@ -730,20 +833,23 @@ def cmd_land(a):
     branch = git(top, "branch", "--show-current")
     if git(top, "rev-list", "--count", f"origin/{base}..HEAD") == "0":
         sys.exit("session: nothing to land")
-    if not rebase_on_base(top, base, branch):
+    pin = rebase_on_base(top, base, branch)
+    if not pin:
         return 3
-    if git(top, "rev-list", "--count", f"origin/{base}..HEAD") == "0":
+    if git(top, "rev-list", "--count", f"{pin}..HEAD") == "0":
         print(f"nothing new to land: everything on this branch is already on origin/{base}")
         return 0
+    gate = pre_land_commands(top)  # read first: a broken declaration stops the land with its own reason
     audit = top / ".agents" / "bin" / "agent_repo_audit.py"
     if audit.exists():
-        ar = run([sys.executable, str(audit), "--check", "--against", f"origin/{base}"], top, check=False)
+        ar = run([sys.executable, str(audit), "--check", "--against", pin], top, check=False)
         print(ar.stdout.strip())
         if ar.returncode:
             sys.exit("session: audit found errors; fix them and land again")
+    run_pre_land(top, gate)  # the tree that would land: this branch rebased onto origin/<base> (kit 18)
     if not portability_check(top):
         sys.exit("session: portability check failed (the check CI used to run on every push); fix it and land again")
-    changed = name_list(top, "--no-renames", f"origin/{base}...HEAD")
+    changed = name_list(top, "--no-renames", f"{pin}...HEAD")
     EVENT["attrs"]["files"] = len(changed)
     # Local landing is the default (WS-DDR-143 amendment 2026-09-24): the checks already ran here,
     # so a PR would only buy a second, billed run of them. A PR is used for ask paths (a human
@@ -755,7 +861,15 @@ def cmd_land(a):
     if not why_pr:
         for attempt in range(3):
             head = git(top, "rev-parse", "HEAD")
-            squash = git(top, "commit-tree", f"{head}^{{tree}}", "-p", f"origin/{base}", "-m", land_message(top, base, a.title, branch))
+            # the parent is the commit this branch was rebased onto (pin), never the shared origin/<base>
+            # ref re-read here: a sibling worktree's push moves that ref during the gate (kit 19)
+            squash = git(top, "commit-tree", f"{head}^{{tree}}", "-p", pin, "-m", land_message(top, base, a.title, branch, since=pin))
+            foreign = foreign_paths(top, squash, pin, pin, head)
+            if foreign:
+                EVENT["attrs"]["reason"] = "foreign_paths"
+                sys.exit(f"session: refused: the squash would change {len(foreign)} path(s) this branch never touched "
+                         f"({names(foreign)}); that is another session's landing being reverted. Nothing was pushed. "
+                         "Run `python3 .agents/bin/session land` again, and report this to the kit's owner")
             p = run(["git", "push", "-q", "origin", f"{squash}:refs/heads/{base}"], top, check=False)
             if p.returncode == 0:
                 EVENT["attrs"]["route"] = "local"
@@ -773,8 +887,10 @@ def cmd_land(a):
                 sys.exit(f"session: push to {base} failed:\n{err}")
             # someone landed in between: take their change and go again
             git(top, "fetch", "-q", "origin", base)
-            if not rebase_on_base(top, base, branch):
+            pin = rebase_on_base(top, base, branch)
+            if not pin:
                 return 3
+            run_pre_land(top, pre_land_commands(top))  # a new tree: the other session's landing is in it
             if not portability_check(top):
                 sys.exit("session: portability check failed after the rebase; fix it and land again")
         else:
