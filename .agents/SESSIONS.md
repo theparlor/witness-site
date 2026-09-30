@@ -185,6 +185,20 @@ fetches, rebases and runs the checks again. A guard also refuses, before the pus
 that changes a path none of the branch's own commits touched: that can only be another
 session's landing being undone. Nothing is pushed; land again.
 
+### Reading another session's worktree never takes its lock (kit 20)
+
+`session status` reads every live session's worktree, and `session start` does the same to list
+them. A plain `git status` refreshes the index as a side effect: it takes that worktree's
+`index.lock` and holds it while it walks the worktree. Through kit 19, the session that owned the
+worktree could have its own `git add` fail in that moment ("index.lock: File exists"); a land
+that did not check its add committed half of its files (Cast, 30 September 2026).
+
+Now every read the kit makes of a worktree runs with `GIT_OPTIONAL_LOCKS=0`. Git then skips the
+optional refresh and takes no lock; what the read reports is the same. The kit's own writes
+(fetch, rebase, commit, the primary's fast-forward) take their locks as before. A script of your
+own that inspects another session's worktree should do the same:
+`GIT_OPTIONAL_LOCKS=0 git -C <worktree> status`.
+
 ## What the hooks enforce
 
 A Claude Code hook blocks Write and Edit into the primary checkout of any repo that carries
