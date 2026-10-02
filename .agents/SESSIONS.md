@@ -66,7 +66,8 @@ Witness when Witness is on the machine (WS-DDR-150); a missing or failing Witnes
 python3 .agents/bin/session start <task> --own <path> --objective "<one line>"
 ```
 
-Creates the worktree and branch and prints the worktree path. Do all your work there.
+Creates the worktree and branch and prints the worktree path. Do all your work there. It first
+checks free disk, and refuses when the new checkout would leave too little (kit 21, below).
 
 ```bash
 python3 .agents/bin/session status
@@ -198,6 +199,32 @@ optional refresh and takes no lock; what the read reports is the same. The kit's
 (fetch, rebase, commit, the primary's fast-forward) take their locks as before. A script of your
 own that inspects another session's worktree should do the same:
 `GIT_OPTIONAL_LOCKS=0 git -C <worktree> status`.
+
+### Free disk before a new worktree (kit 21)
+
+Every session worktree is a full checkout: 0.65 to 3.5 GB each across these repos. On 2 October
+2026 about 105 of them had piled up on one machine, the disk fell to 2 GB free, and nothing had
+said a word as each one was cut.
+
+Now `start` measures the disk that will hold the new worktree before `git worktree add`, and
+estimates the checkout from the sizes git records for the base tree (`git ls-tree -r -l`, under a
+second even for the largest repo; it never walks the primary). Then:
+
+- If the checkout would leave less than 10 GB free, `start` refuses: exit status 1, no worktree,
+  no branch, no task file. The message gives the free space, the estimate, the floor and how many
+  worktrees this repo already has, and says what to do: `session status` to see them, `session
+  finish` in each one that has landed. The hourly worktree reaper (`com.brien.worktree-reaper`)
+  retires landed, idle worktrees on its own.
+- If it would leave less than 25 GB, `start` goes ahead and prints a line beginning
+  `session: WARNING: LOW DISK` on stderr.
+- `start --here` checks nothing out, so it only ever warns.
+- Anything that goes wrong while measuring prints one note and the start goes ahead unguarded.
+
+`SESSION_MIN_FREE_GB` and `SESSION_WARN_FREE_GB` move the two lines. `SESSION_ALLOW_LOW_DISK=1`
+starts anyway, for that one command. The Witness event of a `start` carries the numbers
+(`free_gb`, `estimate_gb`) and the result (`disk_guard`: `guard_ok`, `guard_warn`,
+`guard_refused`, `guard_overridden`, or `guard_skipped` when measuring failed); a refusal is
+reported as `blocked` with reason `low_disk`.
 
 ## What the hooks enforce
 
