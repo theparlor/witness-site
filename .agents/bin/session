@@ -28,6 +28,8 @@ into the worktree's git dir first and put back after, and `finish` waits while a
 A read of a worktree, above all another session's, runs with GIT_OPTIONAL_LOCKS=0 (READ_ONLY): a plain
 `git status` takes the worktree's index.lock while it walks it, and the other session's `git add` in that
 moment fails (kit 20).
+`start` refuses to cut a worktree that would leave the disk under SESSION_MIN_FREE_GB (10) free, and warns under
+SESSION_WARN_FREE_GB (25); SESSION_ALLOW_LOW_DISK=1 starts anyway, once. Fail-open on any measuring error (kit 21).
 """
 import argparse, contextlib, datetime as dt, filecmp, fnmatch, importlib.util, io, json, os, re, shutil, signal, subprocess, sys, time
 from pathlib import Path
@@ -176,8 +178,8 @@ def witness_report(cmd, code, started):
             return
         if code in (0, None):
             outcome = "ok"
-        elif isinstance(code, int) and (code == 3 or EVENT["attrs"].get("reason") == "wrong_repo"):
-            outcome = "blocked"  # stopped for a person: a rebase conflict, or a shell in the wrong repository
+        elif code == 3 or EVENT["attrs"].get("reason") in ("wrong_repo", "low_disk"):
+            outcome = "blocked"  # stopped for a person: a rebase conflict, a shell in the wrong repository, a full disk
         elif cmd == "status" and code == 1:
             outcome = "ok"  # overlaps found: a finding, not a failure
         else:
@@ -592,6 +594,88 @@ def pushed(top, rev="HEAD"):
     return bool(git(top, "branch", "-r", "--contains", rev, check=False))
 
 
+# Free-disk guard on `start` (kit 21). On 2026-10-02 Aurelius fell to 2 GB free: about 105 session worktrees
+# had piled up across the repos (0.65 to 3.5 GB each, 3.4 GB for the Subaru engagement repo) and nothing said a
+# word when the next one was cut. `start` now measures the disk that will hold the new worktree, estimates the
+# checkout from the base tree's blob sizes (never a walk of the primary), refuses under a floor and warns under
+# a softer line. Fail-open: a measurement that errors prints one note and the start goes on.
+GB = 1024 ** 3
+MIN_FREE_GB, WARN_FREE_GB = 10.0, 25.0  # SESSION_MIN_FREE_GB, SESSION_WARN_FREE_GB override; SESSION_ALLOW_LOW_DISK=1 overrides once
+
+
+def _env_gb(name, default):
+    v = os.environ.get(name, "").strip()
+    return float(v) if v else default
+
+
+def checkout_estimate(repo, ref):
+    """Bytes a checkout of `ref` writes: the sum of its blob sizes from `git ls-tree -r -l -z`, read as bytes so
+    no file name can fail to decode. A gitlink (a submodule, size "-") is skipped; so is any other entry git
+    gives no size. An LFS file counts as its pointer, so this can read low for an LFS repository."""
+    r = subprocess.run(["git", "ls-tree", "-r", "-l", "-z", ref], cwd=repo, capture_output=True,
+                       env={**os.environ, **READ_ONLY})
+    if r.returncode:
+        raise RuntimeError(f"git ls-tree exited {r.returncode}")
+    total = 0
+    for entry in r.stdout.split(b"\0"):
+        meta = entry.partition(b"\t")[0].split()
+        if len(meta) == 4 and meta[1] == b"blob" and meta[3] != b"-":
+            total += int(meta[3])
+    return total
+
+
+def linked_worktrees(primary):
+    """How many linked worktrees the repository has (every entry of `git worktree list` but the primary)."""
+    out = git(primary, "worktree", "list", "--porcelain", env=READ_ONLY)
+    return max(0, sum(1 for line in out.splitlines() if line.startswith("worktree ")) - 1)
+
+
+def disk_guard(primary, where, ref, adopt):
+    """Refuse (exit, nothing created), warn, or pass before `start` cuts a worktree at `where` from `ref`.
+
+    adopt (`--here`): nothing new is checked out, so it only ever warns. The Witness event gets the numbers
+    (free_gb, estimate_gb) and the result (disk_guard: guard_ok, guard_warn, guard_refused, guard_overridden,
+    or guard_skipped when the measurement failed), never a path. The key is disk_guard, not outcome: the
+    event's own outcome field is witness_report's, and a second one would make the emit call raise."""
+    try:
+        floor = _env_gb("SESSION_MIN_FREE_GB", MIN_FREE_GB)
+        soft = _env_gb("SESSION_WARN_FREE_GB", WARN_FREE_GB)
+        free = shutil.disk_usage(where).free
+        estimate = 0 if adopt else checkout_estimate(primary, ref)
+    except Exception as e:  # fail-open: the guard never stops a start it could not measure
+        EVENT["attrs"]["disk_guard"] = "guard_skipped"
+        print(f"session: note: free-disk check skipped ({type(e).__name__}: {e}); starting without it", file=sys.stderr)
+        return
+    after = (free - estimate) / GB
+    EVENT["attrs"].update(free_gb=round(free / GB, 2), estimate_gb=round(estimate / GB, 2))
+    if after >= soft and (adopt or after >= floor):
+        EVENT["attrs"]["disk_guard"] = "guard_ok"
+        return
+    try:
+        n = linked_worktrees(primary)
+    except BaseException:  # the count only decorates the message
+        n = "an unknown number of"
+    numbers = (f"{free / GB:.1f} GB free on this disk (adopting this worktree checks out nothing new)" if adopt else
+               f"{free / GB:.1f} GB free on the disk that would hold it, the checkout needs about "
+               f"{estimate / GB:.2f} GB, leaving {after:.1f} GB")
+    remedy = (f"This repository has {n} linked worktree(s). See them with `python3 .agents/bin/session status`, "
+              f"and run `python3 .agents/bin/session finish` in each one that has landed. The hourly worktree "
+              f"reaper (com.brien.worktree-reaper) retires landed, idle worktrees on its own.")
+    if not adopt and after < floor:
+        if os.environ.get("SESSION_ALLOW_LOW_DISK", "").strip() == "1":
+            EVENT["attrs"]["disk_guard"] = "guard_overridden"
+            print(f"session: WARNING: LOW DISK, starting anyway because SESSION_ALLOW_LOW_DISK=1: {numbers}, "
+                  f"under the {floor:g} GB floor (SESSION_MIN_FREE_GB). {remedy}", file=sys.stderr)
+            return
+        EVENT["attrs"].update(disk_guard="guard_refused", reason="low_disk")
+        sys.exit(f"session: refusing to cut a new worktree, nothing was created: {numbers}, under the {floor:g} GB "
+                 f"floor (SESSION_MIN_FREE_GB).\n{remedy}\nTo start anyway, once: "
+                 f"SESSION_ALLOW_LOW_DISK=1 python3 .agents/bin/session start <task> ...")
+    EVENT["attrs"]["disk_guard"] = "guard_warn"
+    print(f"session: WARNING: LOW DISK: {numbers}, under the {soft:g} GB warning line (SESSION_WARN_FREE_GB). "
+          f"{remedy}", file=sys.stderr)
+
+
 def cmd_start(a):
     top, primary, linked = here(a.here)
     EVENT["attrs"].update(adopt=bool(a.here), linked=linked)
@@ -618,12 +702,14 @@ def cmd_start(a):
         if not branch:
             sys.exit("session: --here needs a branch checked out (this worktree is detached)")
         base_commit = git(top, "rev-parse", "--short", git(top, "merge-base", f"origin/{base}", "HEAD"))
+        disk_guard(primary, top, None, adopt=True)
     else:
         branch = f"agent/{provider}/{name}"
         wt = primary.parent / f"{primary.name}-wt-{name}"
         if wt.exists():
             sys.exit(f"session: {wt} already exists; pick another task name or `cd` there")
         base_commit = git(primary, "rev-parse", "--short", f"origin/{base}")
+        disk_guard(primary, wt.parent, f"origin/{base}", adopt=False)
         git(primary, "worktree", "add", "-q", "-b", branch, str(wt), f"origin/{base}")
     activate_prepush(primary)
     rel = os.path.relpath(wt, primary)
