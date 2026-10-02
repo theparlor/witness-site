@@ -1,0 +1,15 @@
+{
+  "id": "2026-10-02-claude-shard-ignore",
+  "provider": "claude",
+  "status": "complete",
+  "branch": "agent/claude/2026-10-02-shard-ignore",
+  "worktree": "../witness-site-wt-2026-10-02-shard-ignore",
+  "base_commit": "ccde95f",
+  "objective": "gitignore: ignore intent session.end shards",
+  "owned_paths": [
+    ".gitignore"
+  ],
+  "started": "2026-10-02T09:51:26-04:00",
+  "handoff": ".agents/handoffs/2026-10-02-claude-shard-ignore.md",
+  "landed": "2026-10-02T09:51:27-04:00"
+}
