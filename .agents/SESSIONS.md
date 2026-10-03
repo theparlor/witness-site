@@ -231,5 +231,5 @@ reported as `blocked` with reason `low_disk`.
 A Claude Code hook blocks Write and Edit into the primary checkout of any repo that carries
 this file. Another blocks `git worktree add` to anywhere but the sibling pattern (the desktop
 app makes its worktrees outside that hook, which is why they are the second valid place). Both
-print the command to run instead. A repo may add a commit-time backstop of its own (the Subaru
-engagement's pre-commit does); it must admit both valid places.
+print the command to run instead. A repo may add a commit-time backstop of its own (one engagement
+repo's pre-commit does); it must admit both valid places.
