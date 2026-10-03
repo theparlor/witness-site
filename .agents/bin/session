@@ -30,6 +30,8 @@ A read of a worktree, above all another session's, runs with GIT_OPTIONAL_LOCKS=
 moment fails (kit 20).
 `start` refuses to cut a worktree that would leave the disk under SESSION_MIN_FREE_GB (10) free, and warns under
 SESSION_WARN_FREE_GB (25); SESSION_ALLOW_LOW_DISK=1 starts anyway, once. Fail-open on any measuring error (kit 21).
+`land` measures content changes against KF-11 (over 25 files per session or per agent per day lands only as a
+reviewed diff): advisory, with a review summary in the handoff; SESSION_KF11_ENFORCE=1 makes it a refusal (kit 23).
 """
 import argparse, contextlib, datetime as dt, filecmp, fnmatch, importlib.util, io, json, os, re, shutil, signal, subprocess, sys, time
 from pathlib import Path
@@ -178,8 +180,8 @@ def witness_report(cmd, code, started):
             return
         if code in (0, None):
             outcome = "ok"
-        elif code == 3 or EVENT["attrs"].get("reason") in ("wrong_repo", "low_disk"):
-            outcome = "blocked"  # stopped for a person: a rebase conflict, a shell in the wrong repository, a full disk
+        elif code == 3 or EVENT["attrs"].get("reason") in ("wrong_repo", "low_disk", "kf11"):
+            outcome = "blocked"  # stopped for a person: a rebase conflict, a shell in the wrong repo, a full disk, KF-11
         elif cmd == "status" and code == 1:
             outcome = "ok"  # overlaps found: a finding, not a failure
         else:
@@ -902,6 +904,203 @@ def foreign_paths(top, squash, parent, own_base, head="HEAD"):
     return sorted(landing - own)
 
 
+# KF-11, the knowledge farm's backpressure rule (kit 23): any content change over 25 files, counted per session
+# and per day, lands only as a reviewed diff. On 2026-10-02 agents rewrote about 1,450 private files in place
+# across many repos and landed them the same day, unread. The rule is measured on totals, so splitting the work
+# into small lands does not dodge it. Advisory for now: `land` prints the advisory, writes a per-file diff
+# summary into the session's handoff (which becomes the PR description on the PR route), and tells Witness.
+# SESSION_KF11_ENFORCE=1, or "kf11": {"enforce": true} in .agents/repository-policy.json, turns it into a
+# refusal of every route but `--no-merge` (a PR left open for a human). The rule text, under the Workspaces root:
+KF11_RULE = "Core/products/_intake/2026-10-03-knowledge-farm-projection/rules/knowledge-farm-rules.md"
+KF11_THRESHOLD = 25
+# What is not content: the kit's own session records, lockfiles and generated outputs. Generated outputs are the
+# repository's generated_patterns and kf11.exclude (repository-policy.json), files marked linguist-generated in
+# .gitattributes, and the defaults below. Everything else (prose, code, data, images, a deletion) is content.
+KF11_NOT_CONTENT_DIRS = (".agents/",)
+KF11_LOCKFILES = {"package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "bun.lock",
+                  "poetry.lock", "Pipfile.lock", "uv.lock", "pdm.lock", "Cargo.lock", "Gemfile.lock", "composer.lock",
+                  "go.sum", "flake.lock", "mix.lock", "Podfile.lock", "packages.lock.json"}
+KF11_GENERATED = ["**/node_modules/**", "**/__pycache__/**", "**/.venv/**", "**/dist/**", "**/generated/**",
+                  "*.pyc", "*.min.js", "*.min.css", "*.js.map", "*.css.map", ".intent/observability/**"]
+KF11_START, KF11_END = "<!-- kf11:start -->", "<!-- kf11:end -->"
+KF11_ROWS = 300  # rows of the per-file table in the handoff; the whole diff is one git command away
+LANDED_FROM = re.compile(r"Landed locally by session land from (\S+) \(")
+
+
+def _glob(path, pattern):
+    """The audit's matcher: fnmatch, with a leading **/ also matching at the top level."""
+    return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path, pattern.removeprefix("**/"))
+
+
+def kf11_content(top, paths):
+    """The paths that are content (see KF11_NOT_CONTENT_DIRS above). An unreadable policy or a failed attribute
+    read only means fewer exclusions, so the count errs high, never low."""
+    pol = policy(top)
+    kf = pol.get("kf11") if isinstance(pol.get("kf11"), dict) else {}
+    pats = [p for p in KF11_GENERATED + list(pol.get("generated_patterns", [])) + list(kf.get("exclude", []))
+            if isinstance(p, str)]
+    out = [p for p in paths if not p.startswith(KF11_NOT_CONTENT_DIRS) and p.rsplit("/", 1)[-1] not in KF11_LOCKFILES
+           and not any(_glob(p, x) for x in pats)]
+    if out:
+        r = subprocess.run(["git", "check-attr", "-z", "--stdin", "linguist-generated"], cwd=top, capture_output=True,
+                           input="\0".join(out).encode() + b"\0", env={**os.environ, **READ_ONLY})
+        if r.returncode == 0:
+            f = r.stdout.split(b"\0")
+            gen = {f[i].decode(errors="replace") for i in range(0, len(f) - 2, 3) if f[i + 2] in (b"set", b"true")}
+            out = [p for p in out if p not in gen]
+    return out
+
+
+def _branch_agent(branch):
+    """The agent a branch name carries: agent/<provider>/<task>, or the desktop app's <provider>/<name>."""
+    parts = (branch or "").split("/")
+    return (parts[1] if parts[0] == "agent" and len(parts) > 2 else parts[0]) or "unknown"
+
+
+def kf11_agent(task, branch):
+    """Who is landing: AGENT_NAME, else the task's provider, else the branch's (agent/<provider>/..., or the
+    desktop app's <provider>/<name>)."""
+    if os.environ.get("AGENT_NAME", "").strip():
+        return os.environ["AGENT_NAME"].strip()
+    return task.get("provider") or _branch_agent(branch)
+
+
+def kf11_ledger(primary):
+    """This clone's record of landings, in the common git dir every worktree shares (never committed)."""
+    return Path(git(primary, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "session-kf11.jsonl"
+
+
+def kf11_earlier(top, primary, pin, branch, agent, day_start):
+    """(this session's earlier landed content files, today's landed content files by this agent), as sets.
+    Read from origin/<base> (a local landing's squash message names its branch, so landings made on any machine
+    count) and from this clone's ledger (which also holds landings that went through a PR). Fail-open: a read
+    that breaks leaves what was read so far."""
+    mine, today = set(), set()
+    try:
+        log = run(["git", "log", "-F", "--grep=Landed locally by session land from ", "--format=%H%x1f%cI%x1f%B%x1e",
+                   pin], top, check=False, env=READ_ONLY).stdout
+        for rec in log.split("\x1e"):
+            parts = rec.strip("\n").split("\x1f")
+            m = LANDED_FROM.search(parts[2]) if len(parts) == 3 else None
+            if not m:
+                continue
+            ours = m.group(1) == branch
+            todays = dt.datetime.fromisoformat(parts[1]) >= day_start and _branch_agent(m.group(1)) == agent
+            if not (ours or todays):
+                continue
+            names_ = [x for x in run(["git", "diff-tree", "--no-commit-id", "-r", "-z", "--name-only", "--no-renames",
+                                      parts[0].strip()], top, check=False, env=READ_ONLY).stdout.split("\0") if x]
+            files = set(kf11_content(top, names_))
+            if ours:
+                mine |= files
+            if todays:
+                today |= files
+        led = kf11_ledger(primary)
+        for line in led.read_text().splitlines() if led.is_file() else []:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            files = {x for x in e.get("files", []) if isinstance(x, str)}
+            if e.get("branch") == branch:
+                mine |= files
+            if e.get("agent") == agent and e.get("day") == day_start.date().isoformat():
+                today |= files
+    except Exception:
+        pass
+    return mine, today
+
+
+def kf11_record(primary, agent, branch, files):
+    """One line per landing in this clone's ledger. Fail-open."""
+    try:
+        with open(kf11_ledger(primary), "a") as f:
+            f.write(json.dumps({"day": dt.date.today().isoformat(), "agent": agent, "branch": branch,
+                                "at": dt.datetime.now().astimezone().isoformat(timespec="seconds"), "files": files}) + "\n")
+    except Exception:
+        pass
+
+
+def kf11_summary(top, pin, content, session_n, day_n, agent):
+    """The per-file diff summary a reviewer reads: the section land writes into the handoff."""
+    rows, status = {}, {}
+    for line in run(["git", "diff", "--numstat", "-z", "--no-renames", pin, "HEAD"], top, check=False).stdout.split("\0"):
+        bits = line.split("\t")
+        if len(bits) == 3:
+            rows[bits[2]] = (bits[0], bits[1])
+    raw = run(["git", "diff", "--name-status", "-z", "--no-renames", pin, "HEAD"], top, check=False).stdout.split("\0")
+    for i in range(0, len(raw) - 1, 2):
+        status[raw[i + 1]] = raw[i]
+    head = git(top, "rev-parse", "--short=10", "HEAD", check=False)
+    lines = [KF11_START, "## KF-11 review: a content change over the threshold", "",
+             f"Rule KF-11 (`{KF11_RULE}`, under the Workspaces root): any content change over {KF11_THRESHOLD} files, "
+             "counted per session and per day, lands only as a reviewed diff.", "",
+             f"- This land: {len(content)} content file(s). This session in all: {session_n}. "
+             f"Today, by agent `{agent}` in this repository: {day_n}. Threshold: {KF11_THRESHOLD}.",
+             f"- Base `{pin[:10]}`, head `{head}` (the head before the squash). The whole diff: `git diff {pin[:10]} {head}`.",
+             "- Reviewer: read the table and the diff, then say yes or no.", "",
+             "| File | Change | Added | Removed |", "|---|---|---|---|"]
+    for p in content[:KF11_ROWS]:
+        add, rem = rows.get(p, ("?", "?"))
+        lines.append(f"| `{p}` | {status.get(p, '?')} | {add} | {rem} |")
+    if len(content) > KF11_ROWS:
+        lines.append(f"| and {len(content) - KF11_ROWS} more | | | |")
+    lines.append(KF11_END)
+    return "\n".join(lines) + "\n"
+
+
+def kf11_check(a, top, primary, pin, task, branch):
+    """Measure this land against KF-11. Over the threshold: print the advisory, write the review section into
+    the handoff and commit it (a .agents/ path, so it adds nothing to the count), and under enforcement refuse
+    every route but --no-merge. Returns (agent, content files of this land)."""
+    content = kf11_content(top, name_list(top, "--no-renames", pin, "HEAD"))
+    agent = kf11_agent(task, branch)
+    day_start = dt.datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    mine, today = kf11_earlier(top, primary, pin, branch, agent, day_start)
+    session_n, day_n = len(mine | set(content)), len(today | set(content))
+    EVENT["attrs"].update(kf11_files=len(content), kf11_session_files=session_n, kf11_day_files=day_n,
+                          kf11_threshold=KF11_THRESHOLD)
+    if session_n <= KF11_THRESHOLD and day_n <= KF11_THRESHOLD:
+        EVENT["attrs"]["kf11"] = "under"
+        return agent, content
+    pol = policy(top)
+    enforce = (os.environ.get("SESSION_KF11_ENFORCE", "").strip() == "1"
+               or (isinstance(pol.get("kf11"), dict) and pol["kf11"].get("enforce") is True))
+    over = [x for x, n in (("this session", session_n), (f"today's lands by {agent}", day_n)) if n > KF11_THRESHOLD]
+    rel = task.get("handoff") or f".agents/handoffs/{branch.replace('/', '-')}.md"
+    try:
+        h = top / rel
+        old = h.read_text() if h.is_file() else f"# Agent handoff: {branch}\n"
+        cut = re.compile(re.escape(KF11_START) + r".*?" + re.escape(KF11_END) + r"\n?", re.S)
+        h.parent.mkdir(parents=True, exist_ok=True)
+        h.write_text(cut.sub("", old).rstrip("\n") + "\n\n" + kf11_summary(top, pin, content, session_n, day_n, agent))
+        git(top, "add", "--", rel)
+        if git(top, "status", "--porcelain", "--untracked-files=no", env=READ_ONLY):
+            if pushed(top):
+                commit(top, task.get("provider", "claude"), "-q", "-m", "session: KF-11 review summary")
+            else:
+                commit(top, task.get("provider", "claude"), "-q", "--amend", "--no-edit")
+        where = f"The per-file review summary is in {rel}"
+    except SystemExit:
+        raise
+    except Exception as e:  # the advisory never fails a land it could not document
+        where = f"The review summary could not be written ({type(e).__name__})"
+    print(f"\nKF-11 ADVISORY: content changes over {KF11_THRESHOLD} files ({', '.join(over)}): this land {len(content)}, "
+          f"this session {session_n}, today by {agent} {day_n}.\n"
+          f"KF-11 says a change this size lands only as a reviewed diff (rule: {KF11_RULE}, under the Workspaces root).\n"
+          f"{where}. To land it for review: `python3 .agents/bin/session land --no-merge` opens a PR and leaves it "
+          "for a human.")
+    if enforce and not a.no_merge:
+        EVENT["attrs"].update(kf11="refused", reason="kf11")
+        sys.exit("session: refused under KF-11 enforcement (SESSION_KF11_ENFORCE=1, or kf11.enforce in "
+                 ".agents/repository-policy.json); nothing was pushed. Run `python3 .agents/bin/session land --no-merge` "
+                 "so a human reviews the diff")
+    EVENT["attrs"]["kf11"] = "reviewed_pr" if a.no_merge else "advisory"
+    if not a.no_merge:
+        print("KF-11 is advisory today, so this land goes on. SESSION_KF11_ENFORCE=1 turns it into a refusal.\n")
+    return agent, content
+
+
 def cmd_land(a):
     top, primary, linked = here(a.here)
     if not linked:
@@ -943,6 +1142,8 @@ def cmd_land(a):
     if git(top, "rev-list", "--count", f"{pin}..HEAD") == "0":
         print(f"nothing new to land: everything on this branch is already on origin/{base}")
         return 0
+    # KF-11 (kit 23): measured on the rebased tree, before the gates, so its handoff commit is judged with the rest
+    kf_agent, kf_content = kf11_check(a, top, primary, pin, json.loads(t.read_text()) if t and t.is_file() else {}, branch)
     gate = pre_land_commands(top)  # read first: a broken declaration stops the land with its own reason
     audit = top / ".agents" / "bin" / "agent_repo_audit.py"
     if audit.exists():
@@ -978,6 +1179,7 @@ def cmd_land(a):
             if p.returncode == 0:
                 EVENT["attrs"]["route"] = "local"
                 print(f"landed locally as {squash[:8]} on origin/{base} (no PR, no CI run)")
+                kf11_record(primary, kf_agent, branch, kf_content)
                 # the branch follows its squash (same tree): a later land replays only what is new
                 follow(top, squash, head, base)
                 ff_primary(primary, base)
@@ -1016,10 +1218,13 @@ def cmd_land(a):
         if t:
             h = top / json.loads(t.read_text()).get("handoff", "")
             if h.is_file():
-                body = h.read_text()[:6000]
+                text = h.read_text()
+                i = text.find(KF11_START)  # a KF-11 review section always reaches the PR description whole
+                body = text[:6000] if i < 0 else (text[:min(i, 3000)].rstrip() + "\n\n" + text[i:])[:60000]
         pr = run(["gh", "pr", "create", *gh_repo(top), "--head", branch, "--base", base, "--title", title, "--body", body + FOOTER], top)
     url = pr.stdout.strip().splitlines()[-1]
     print(f"PR: {url}")
+    kf11_record(primary, kf_agent, branch, kf_content)
     if hits or a.no_merge:
         print("Left open for a human" + (f": touches ask paths {sorted(set(hits))[:8]}" if hits else ""))
         return 0
