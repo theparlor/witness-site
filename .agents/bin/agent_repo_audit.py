@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Read-only safety checks shared by all coding-agent providers.
 
-Generalized from the Subaru engagement's scripts/agent_repo_audit.py. Managed by
+Generalized from one engagement repo's scripts/agent_repo_audit.py. Managed by
 org-design-tooling/repo-kit; overwritten on every kit update. Standard: .agents/SESSIONS.md.
 
 Read-only roots (external_read_only_roots in .agents/repository-policy.json) hold originals: filing

@@ -455,7 +455,7 @@ def keep_untracked(top, base, onto=None, up=None):
     """Copy aside each file this branch untracks (`git rm --cached`) that is still on disk and that
     the rebase target still tracks. The rebase checks the target out first, git overwrites an
     ignored file there without asking, and replaying the untrack commit then deletes it: the loss
-    `git rm --cached` promises never happens (Subaru, 2026-09-24). Returns the paths kept."""
+    `git rm --cached` promises never happens (an engagement repo, 2026-09-24). Returns the paths kept."""
     up = up or f"origin/{base}"
     mb = git(top, "merge-base", "HEAD", up, check=False)
     if not mb:
@@ -595,7 +595,7 @@ def pushed(top, rev="HEAD"):
 
 
 # Free-disk guard on `start` (kit 21). On 2026-10-02 Aurelius fell to 2 GB free: about 105 session worktrees
-# had piled up across the repos (0.65 to 3.5 GB each, 3.4 GB for the Subaru engagement repo) and nothing said a
+# had piled up across the repos (0.65 to 3.5 GB each, 3.4 GB for the largest engagement repo) and nothing said a
 # word when the next one was cut. `start` now measures the disk that will hold the new worktree, estimates the
 # checkout from the base tree's blob sizes (never a walk of the primary), refuses under a floor and warns under
 # a softer line. Fail-open: a measurement that errors prints one note and the start goes on.
@@ -753,7 +753,7 @@ def name_list(cwd, *a, check=True, env=None):
 def changed_paths(wt, base):
     """Paths a worktree changes: committed since the base plus uncommitted. Both are read with -z,
     unstripped and unquoted: `git()` strips its output, which ate the leading space of the first
-    porcelain line (` M path`) and so the path's first character (Subaru, 2026-09-25), and without
+    porcelain line (` M path`) and so the path's first character (an engagement repo, 2026-09-25), and without
     -z git quotes a path with a space or a non-ASCII byte. A rename gives both its old and new path,
     because another session touching either one is an overlap. wt is usually another session's worktree:
     both reads run READ_ONLY, so the status never takes its index lock (kit 20)."""
