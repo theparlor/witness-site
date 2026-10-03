@@ -226,6 +226,37 @@ starts anyway, for that one command. The Witness event of a `start` carries the 
 `guard_refused`, `guard_overridden`, or `guard_skipped` when measuring failed); a refusal is
 reported as `blocked` with reason `low_disk`.
 
+### Content changes over 25 files land as a reviewed diff (KF-11, kit 23)
+
+On 2 October 2026 agents rewrote about 1,450 private files in place across many repos and landed
+them the same day, unread. Rule KF-11 of the knowledge farm rules
+(`Core/products/_intake/2026-10-03-knowledge-farm-projection/rules/knowledge-farm-rules.md`, under
+the Workspaces root) says a content change over 25 files, counted per session and per day, lands
+only as a reviewed diff.
+
+`land` counts content files: every path the landing changes except `.agents/`, lockfiles
+(`package-lock.json`, `uv.lock`, `go.sum` and the like) and generated output (the repository's
+`generated_patterns`, any `kf11.exclude` globs in `.agents/repository-policy.json`, files marked
+`linguist-generated` in `.gitattributes`, and `node_modules`, `__pycache__`, `.venv`, `dist`,
+`generated`, minified and map files, `.intent/observability/`). A deletion counts. It adds up two
+totals, so splitting the work into small lands does not dodge them:
+
+- this session: this land plus every earlier landing of the same branch;
+- today: this land plus every landing today in this repository by the same agent (`AGENT_NAME`,
+  else the task's provider), read from main's history and from this clone's ledger
+  (`session-kf11.jsonl` in the common git dir, which also holds PR landings).
+
+When either passes 25, `land` prints a `KF-11 ADVISORY` naming the counts and the rule, writes a
+per-file table (path, change, lines added and removed) between `<!-- kf11:start -->` and
+`<!-- kf11:end -->` in the session's handoff, commits it with the work, and reports `kf11` in its
+Witness event (`under`, `advisory`, `reviewed_pr` or `refused`, with the three counts). The handoff
+is the PR description on the PR route, so the reviewer reads the table there.
+
+Today it is advisory and the land goes on. To land for review, run
+`python3 .agents/bin/session land --no-merge`: it opens a PR and leaves it for a human.
+`SESSION_KF11_ENFORCE=1`, or `"kf11": {"enforce": true}` in `.agents/repository-policy.json`, turns
+the advisory into a refusal (exit status 1, nothing pushed) of every route but `--no-merge`.
+
 ## What the hooks enforce
 
 A Claude Code hook blocks Write and Edit into the primary checkout of any repo that carries
