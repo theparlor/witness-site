@@ -221,14 +221,26 @@ def task_files(root):
 
 
 def my_task(root, base_ref):
-    """The task file this branch added (not present on base)."""
-    added = git(root, "diff", "--name-only", "--diff-filter=A", f"{base_ref}...HEAD", "--", ".agents/tasks/", check=False,
-                env=READ_ONLY).split()
-    untracked = git(root, "ls-files", "--others", "--exclude-standard", "--", ".agents/tasks/", check=False,
-                    env=READ_ONLY).split()
+    """This session's task file: the record whose "branch" names the branch checked out here, among the records this
+    branch added, changed (a task name reused the same day: start rewrites the record base already holds) or has not
+    committed yet. Kit 25: until then the first added record won, so a branch that also added an older record (a
+    rename) closed that one and landed its own still live (governance root, 2026-10-02 and 2026-10-03). With no
+    record naming the branch, the first added or untracked one, as before."""
+    def names(*a):
+        return [r for r in git(root, *a, "--", ".agents/tasks/", check=False, env=READ_ONLY).split() if r.endswith(".json")]
+    added = names("diff", "--name-only", "--diff-filter=A", f"{base_ref}...HEAD")
+    changed = names("diff", "--name-only", "--diff-filter=M", f"{base_ref}...HEAD") + names("diff", "--name-only", "HEAD")
+    untracked = names("ls-files", "--others", "--exclude-standard")
+    branch = git(root, "branch", "--show-current", check=False, env=READ_ONLY)
+    if branch:
+        for rel in dict.fromkeys(added + untracked + changed):
+            try:
+                if json.loads((root / rel).read_text()).get("branch") == branch:
+                    return root / rel
+            except (OSError, ValueError):
+                continue
     for rel in added + untracked:
-        if rel.endswith(".json"):
-            return root / rel
+        return root / rel
     return None
 
 
