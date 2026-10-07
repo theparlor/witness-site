@@ -10,6 +10,10 @@ a new one is the point, editing an existing one is never done. Three changes are
 the same root (a rename with 100% similarity), a deletion whose bytes remain at another path under
 the same root (dropping an exact duplicate), and an edit to an index file (a basename listed in
 read_only_root_index_files, CONTEXT.md by default) at any depth under the root.
+
+A task record with a live status whose worktree and branch are both gone is a stale lock (kit 24): it is
+named in a warning at every land, and an ownership overlap it causes says so, with the fix. It still
+counts in the overlap check, because a session on another machine has no worktree or branch here either.
 """
 import argparse, fnmatch, json, os, subprocess, sys
 from pathlib import Path
@@ -40,6 +44,25 @@ def tasks():
             try: out.append(json.loads(f.read_text()))
             except Exception: pass
     return out
+
+def branch_exists(branch):
+    """A local branch or its remote-tracking copy."""
+    return any(subprocess.run(["git", "rev-parse", "--verify", "--quiet", ref], cwd=ROOT, capture_output=True).returncode == 0
+               for ref in (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"))
+
+def stale(t):
+    """A live record whose session left nothing behind on this machine: its worktree path and its branch are both
+    gone (removed by hand, never `session finish`, which is what sets a record complete). It still joins the ownership
+    check below, so it can block every land that touches its paths (kit 24). A session on another machine looks the
+    same from here, which is why the check names it and never drops it."""
+    if t.get("status") not in LIVE: return False
+    wt, branch = str(t.get("worktree") or ""), str(t.get("branch") or "")
+    if wt:
+        p = Path(wt)
+        common = Path(git(ROOT, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()).parent
+        if any(c.exists() for c in ([p] if p.is_absolute() else [ROOT / p, common / p, common.parent / p.name])): return False
+    if branch and branch_exists(branch): return False
+    return True
 
 def head_blobs(root):
     """Blob ids of every tracked path under a read-only root at HEAD."""
@@ -124,12 +147,23 @@ def main():
         # Only an overlap involving this change's own task blocks; older overlaps are reported, not fatal.
         mine = {Path(x).stem for x in changed if x.startswith(".agents/tasks/") and x.endswith(".json")}
         active = [t for t in tasks() if t.get("status") in LIVE or t.get("id") in mine]
+        stale_ids = {t.get("id") for t in active if t.get("id") not in mine and stale(t)}
+        for t in active:
+            if t.get("id") in stale_ids:
+                warnings.append(f"stale task record {t['id']} (status {t['status']}): its worktree {t.get('worktree') or '(none)'} "
+                                f"and branch {t.get('branch') or '(none)'} are gone, and it still joins the ownership check at every "
+                                "land; once you are sure no session on another machine owns it, set its status complete in a "
+                                "session of its own")
         for i, left in enumerate(active):
             for right in active[i + 1:]:
                 for lp in left.get("owned_paths", []):
                     for rp in right.get("owned_paths", []):
                         if lp == rp or lp.startswith(rp.rstrip("/") + "/") or rp.startswith(lp.rstrip("/") + "/"):
                             msg = f"task ownership overlap: {left['id']} and {right['id']} at {lp} / {rp}"
+                            for sid in (left.get("id"), right.get("id")):
+                                if sid in stale_ids:
+                                    msg += (f" ({sid} is a stale record: its worktree and branch are gone; set its status "
+                                            "complete in a session of its own, then land again)")
                             (errors if (mine and {left.get('id'), right.get('id')} & mine) else warnings).append(msg)
     print(f"repository: {ROOT}\nbranch: {branch}\nchanged paths: {len(changed)}")
     for x in errors: print("ERROR:", x)
