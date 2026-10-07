@@ -9,8 +9,18 @@
 # A config hook runs beside any pre-push hook already in .git/hooks or core.hooksPath (Entire, a
 # repo's own .githooks), never instead of it. On a git too old for config hooks (before 2.54) the
 # kit installs .git/hooks/pre-push pointing here, but only when no pre-push hook exists there.
+#
+# Kit 25: it also runs .agents/bin/task-record-check, which refuses a push to the default branch that leaves a session
+# task record live. Both read git's pushed-ref lines, so stdin is read once here and handed to each.
 top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+py=$(command -v python3) || { echo "pre-push: python3 not found; portability and task-record checks skipped" >&2; exit 0; }
+refs=$(cat)
 chk="$top/.agents/bin/portability-check"
-[ -f "$chk" ] || exit 0
-py=$(command -v python3) || { echo "pre-push: python3 not found; portability check skipped" >&2; exit 0; }
-exec "$py" "$chk" --hook "$@"
+if [ -f "$chk" ]; then
+  printf '%s\n' "$refs" | "$py" "$chk" --hook "$@" || exit $?
+fi
+rec="$top/.agents/bin/task-record-check"
+if [ -f "$rec" ]; then
+  printf '%s\n' "$refs" | "$py" "$rec" "$@" || exit $?
+fi
+exit 0

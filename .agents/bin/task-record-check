@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""task-record-check: refuse a push to the default branch that leaves a session task record live (kit 25).
+
+Managed by org-design-tooling/repo-kit; overwritten on every kit update. Run by .agents/hooks/pre-push with git's
+pre-push lines on stdin (<local ref> <local sha> <remote ref> <remote sha>).
+
+WHY
+    `session land` sets the session's record to complete in the landing commit. A change that reaches the default
+    branch any other way (a hand push, a revert, a land settled by hand) carried its record as active, and once the
+    worktree and branch were gone that record was a lock with nothing behind it: the audit's ownership check counted it
+    at every land. Cast's nightly render land failed on one seven nights running (2026-10-01 to 2026-10-07).
+
+RULE
+    For a push to refs/heads/<default branch>: every .agents/tasks/*.json the pushed range adds or changes must not
+    carry a live status (planned, active, review-ready, blocked) at the pushed commit. Pushes of any other branch are
+    never checked (a session branch carries its own live record by design). A deletion, or a brand-new default branch,
+    is not checked. SESSION_ALLOW_LIVE_TASK_PUSH=1 lets one push through and says so.
+
+EXIT 0 the push may go; 1 refused, naming each record and the fix.
+"""
+import json, os, subprocess, sys
+
+LIVE = {"planned", "active", "review-ready", "blocked"}
+ZERO = "0" * 40
+
+
+def git(*a):
+    return subprocess.run(["git", *a], capture_output=True, text=True)
+
+
+def default_branch():
+    r = git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    return r.stdout.strip().split("/", 1)[1] if r.returncode == 0 and "/" in r.stdout else "main"
+
+
+def live_records(local_sha, remote_sha):
+    out = []
+    names = git("diff", "--name-only", "--diff-filter=AM", remote_sha, local_sha, "--", ".agents/tasks/").stdout.split()
+    for rel in names:
+        if not rel.endswith(".json"):
+            continue
+        r = git("show", f"{local_sha}:{rel}")
+        try:
+            rec = json.loads(r.stdout)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("status") in LIVE:
+            out.append((rec.get("id") or rel, rec["status"], rec.get("branch") or "(none)"))
+    return out
+
+
+def main():
+    target = f"refs/heads/{default_branch()}"
+    found = []
+    for line in sys.stdin.read().splitlines():
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        local_ref, local_sha, remote_ref, remote_sha = parts
+        if remote_ref != target or local_sha.strip("0") == "" or remote_sha.strip("0") == "":
+            continue
+        found += live_records(local_sha, remote_sha)
+    if not found:
+        return 0
+    names = ", ".join(f"{i} ({s}, branch {b})" for i, s, b in found)
+    if os.environ.get("SESSION_ALLOW_LIVE_TASK_PUSH") == "1":
+        print(f"pre-push: SESSION_ALLOW_LIVE_TASK_PUSH=1 lets this push leave live task record(s) on {target}: {names}",
+              file=sys.stderr)
+        return 0
+    print(f"pre-push: refused: this push to {target} leaves task record(s) live: {names}.\n"
+          "  A live record on the default branch is a lock: once its worktree and branch are gone it still joins the\n"
+          "  ownership check at every land (kit 24 names it stale). Land through `python3 .agents/bin/session land`,\n"
+          "  which sets the record complete, or set its status to complete in the commit you push. To push anyway,\n"
+          "  once: SESSION_ALLOW_LIVE_TASK_PUSH=1 git push ...", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
