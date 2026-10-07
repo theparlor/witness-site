@@ -11,7 +11,8 @@ the same root (a rename with 100% similarity), a deletion whose bytes remain at 
 the same root (dropping an exact duplicate), and an edit to an index file (a basename listed in
 read_only_root_index_files, CONTEXT.md by default) at any depth under the root.
 
-A task record with a live status whose worktree and branch are both gone is a stale lock (kit 24): it is
+Only the change's own task record (the one naming the branch) counts as the change's own in the overlap check; a
+record the change closes is not (kit 26). A task record with a live status whose worktree and branch are both gone is a stale lock (kit 24): it is
 named in a warning at every land, and an ownership overlap it causes says so, with the fix. It still
 counts in the overlap check, because a session on another machine has no worktree or branch here either.
 """
@@ -145,7 +146,18 @@ def main():
         if changed and not any(x.startswith(".agents/handoffs/") for x in changed):
             warnings.append("no task handoff is present in the change set")
         # Only an overlap involving this change's own task blocks; older overlaps are reported, not fatal.
-        mine = {Path(x).stem for x in changed if x.startswith(".agents/tasks/") and x.endswith(".json")}
+        # This change's own record: the one naming the branch checked out here (kit 26). Until then every record the
+        # change touched counted as its own, so a session closing another record (status complete in this change)
+        # overlapped the record it was closing whenever that record claimed `.agents` (Turnberry, 2026-10-07). With
+        # no record naming the branch, the touched records still live in this tree, never one being closed.
+        touched = {}
+        for x in changed:
+            if x.startswith(".agents/tasks/") and x.endswith(".json") and (ROOT / x).is_file():
+                try: touched[Path(x).stem] = json.loads((ROOT / x).read_text())
+                except Exception: pass
+        mine = {k for k, t in touched.items() if branch != "(detached)" and t.get("branch") == branch}
+        if not mine:
+            mine = {k for k, t in touched.items() if t.get("status") in LIVE}
         active = [t for t in tasks() if t.get("status") in LIVE or t.get("id") in mine]
         stale_ids = {t.get("id") for t in active if t.get("id") not in mine and stale(t)}
         for t in active:
