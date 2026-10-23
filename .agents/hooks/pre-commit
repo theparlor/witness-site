@@ -1,0 +1,24 @@
+#!/bin/sh
+# Session kit pre-commit guard (kit 28). Managed by org-design-tooling/repo-kit; overwritten on every kit update.
+#
+# Runs `.agents/bin/session commit-guard` before every commit in this checkout. It refuses, with the remedy:
+#   - a commit in the PRIMARY checkout (SESSIONS.md rule 1): on 2026-09-23 a session committed on a primary main and
+#     swept in eight paths another session had left staged, reverting fixes already on origin;
+#   - in a worktree `session start` pinned, a commit on a branch other than the one it was started on, or from a
+#     session other than the one that started it: on 2026-08-27 two sessions in one working tree interleaved 25
+#     commits onto one branch while every push reported success.
+# Activated per clone by `session start`, `session land` or install.py as a git config hook:
+#   hook.session-kit-commit-guard.event   = pre-commit
+#   hook.session-kit-commit-guard.command = test ! -f .agents/hooks/pre-commit || sh .agents/hooks/pre-commit
+# A config hook runs beside any pre-commit hook already in .git/hooks or core.hooksPath (a repo's own ownership
+# check), never instead of it. On a git too old for config hooks (before 2.54) the kit installs .git/hooks/pre-commit
+# pointing here, but only when no pre-commit hook exists there. The guard fails open on its own errors and when
+# python3 is missing: a guard must never wedge every commit.
+top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+py=$(command -v python3) || { echo "pre-commit: python3 not found; the session commit guard is skipped" >&2; exit 0; }
+guard="$top/.agents/bin/session"
+[ -f "$guard" ] || exit 0
+"$py" "$guard" commit-guard
+rc=$?
+[ "$rc" -eq 1 ] && exit 1
+exit 0

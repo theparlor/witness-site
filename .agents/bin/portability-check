@@ -26,6 +26,7 @@ from pathlib import Path
 TESTS_PY = "test_no_hardcoded_home.py"
 TESTS_SH = "test-no-hardcoded-home.sh"
 ZERO = "0" * 40
+BACKUP_REFS = ("refs/wip/", "refs/tags/archive/")  # pushed by the backup hook and by retirements, never landed
 
 RUNNER = r"""
 import importlib.util, inspect, sys, traceback, unittest
@@ -129,6 +130,8 @@ def main():
         refs = [l.split() for l in sys.stdin.read().splitlines() if l.strip()]
         if refs and all(len(r) == 4 and r[1] == ZERO for r in refs):
             return 0  # only deleting remote refs: nothing to check
+        if refs and all(len(r) == 4 and (r[1] == ZERO or r[2].startswith(BACKUP_REFS)) for r in refs):
+            return 0  # kit 29: a backup ref (refs/wip/) or an archive tag is never a landing, and holds work in progress
         done = os.environ.get("SESSION_PORTABILITY_CHECKED", "")
         if done and done == git(top, "rev-parse", "HEAD").strip() and not git(top, "status", "--porcelain", "--untracked-files=no").strip():
             return 0  # `session land` just ran this check on this exact commit

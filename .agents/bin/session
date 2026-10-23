@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Parallel-session helper for this repo. Standard: .agents/SESSIONS.md. Stdlib only.
 
-  session start <task> [--own PATH]... [--provider P] [--objective TEXT] [--here]
+  session start <task> [--own PATH]... [--provider P] [--objective TEXT] [--robot] [--here]
   session status [--json] [--here]
   session land [--title T] [--pr] [--no-merge] [--local] [--here]
   session finish [--task TASK] [--here]
+  session retire [--reason TEXT] [--task TASK] [--dry-run] [--here]
+  session wip-backup [--here]          (run by .agents/hooks/post-commit, in the background)
 
 Managed by org-design-tooling/repo-kit; overwritten on every kit update.
 The repository is the one this script lives in (the parent of .agents/), not the one the shell happens
@@ -32,6 +34,12 @@ moment fails (kit 20).
 SESSION_WARN_FREE_GB (25); SESSION_ALLOW_LOW_DISK=1 starts anyway, once. Fail-open on any measuring error (kit 21).
 `land` measures content changes against KF-11 (over 25 files per session or per agent per day lands only as a
 reviewed diff): advisory, with a review summary in the handoff; SESSION_KF11_ENFORCE=1 makes it a refusal (kit 23).
+`commit-guard`, run by .agents/hooks/pre-commit, refuses a commit on the primary checkout and, in a worktree `start`
+pinned, a commit on another branch or from another session; `status` names paths staged on the primary (kit 28).
+Kit 29: after every commit on an agent/* or claude/* branch, .agents/hooks/post-commit runs `wip-backup` in the
+background, which pushes the branch tip to origin as refs/wip/<branch> (a backup, never a landing: no workflow runs,
+no branch appears); `land`, `finish` and `retire` delete it. `retire` keeps abandoned or superseded work on a pushed
+archive tag with a ledger row (retirement.py, shared with the worktree reaper) and removes the worktree.
 """
 import argparse, contextlib, datetime as dt, filecmp, fnmatch, importlib.util, io, json, os, re, shutil, signal, subprocess, sys, time
 from pathlib import Path
@@ -82,8 +90,16 @@ READ_ONLY = {"GIT_OPTIONAL_LOCKS": "0"}
 
 
 def commit(cwd, provider, *a):
-    """Commit with AGENT_NAME set, for repos whose pre-commit checks handoff ownership."""
+    """Commit with AGENT_NAME set, for repos whose pre-commit checks handoff ownership.
+
+    A land run by a session other than the one that started the worktree (a coordinator landing a lane that is
+    gone) is a hand-off, not an interleave: the commit guard's shared-worktree check is passed for this one
+    commit, the pin follows, and the land says so (kit 28)."""
     env = dict(os.environ, AGENT_NAME=os.environ.get("AGENT_NAME") or provider)
+    pin, sid = read_pin(Path(cwd)), session_id()
+    if pin and pin.get("session") and sid and pin["session"] != sid and env.get(ALLOW_SHARED) != "1":
+        env[ALLOW_SHARED] = "1"
+        print(f"note: this worktree was started by session {short_id(pin['session'])}; landing it as a hand-off")
     r = subprocess.run(["git", "commit", *a], cwd=cwd, text=True, capture_output=True, env=env)
     if r.returncode:
         sys.exit(f"session: commit failed in {cwd}:\n{(r.stderr or r.stdout).strip()}")
@@ -178,9 +194,11 @@ def witness_report(cmd, code, started):
         emit = witness_emit()
         if emit is None:
             return
-        if code in (0, None):
+        if EVENT.get("outcome"):
+            outcome = EVENT["outcome"]  # a verb that always exits 0 but knows better (wip-backup's failed push)
+        elif code in (0, None):
             outcome = "ok"
-        elif code == 3 or EVENT["attrs"].get("reason") in ("wrong_repo", "low_disk", "kf11"):
+        elif code == 3 or EVENT["attrs"].get("reason") in ("wrong_repo", "low_disk", "kf11", *GUARD_REASONS):
             outcome = "blocked"  # stopped for a person: a rebase conflict, a shell in the wrong repo, a full disk, KF-11
         elif cmd == "status" and code == 1:
             outcome = "ok"  # overlaps found: a finding, not a failure
@@ -274,37 +292,178 @@ def ff_primary(primary, base):
     return True
 
 
-HOOK_NAME = "session-kit-portability"
-HOOK_CMD = "test ! -f .agents/hooks/pre-push || sh .agents/hooks/pre-push"
-SHIM_MARK = "# session-kit pre-push shim"
+# The kit's git hooks, one config hook each (kit 28 added the pre-commit guard beside the pre-push check).
+# Each command tests for its hook file relative to the worktree it runs in, so a worktree cut from an older
+# kit, which has no .agents/hooks/pre-commit, is left alone by a clone whose config already names the guard.
+HOOKS = (("session-kit-portability", "pre-push", "the pre-push portability check"),
+         ("session-kit-commit-guard", "pre-commit", "the commit guard"),
+         ("session-kit-wip-backup", "post-commit", "the backup push after each commit"))
+
+
+def hook_cmd(event):
+    return f"test ! -f .agents/hooks/{event} || sh .agents/hooks/{event}"
+
+
+def shim_mark(event):
+    return f"# session-kit {event} shim"
+
+
+def activate_hook(repo, name, event, what):
+    """Turn on .agents/hooks/<event> for this clone without displacing any existing hook.
+
+    Git 2.54+ config hooks run beside the hook directory's own hook (Entire, a repo's .githooks), so this
+    only adds. On an older git, a .git/hooks/<event> shim is written only when core.hooksPath is unset and
+    no such hook exists. Same logic as repo-kit/install.py."""
+    cmd, mark = hook_cmd(event), shim_mark(event)
+    have = git(repo, "config", "--get", f"hook.{name}.command", check=False)
+    if have != cmd:
+        git(repo, "config", f"hook.{name}.event", event, check=False)
+        git(repo, "config", f"hook.{name}.command", cmd, check=False)
+    listed = run(["git", "hook", "list", event], repo, check=False)
+    if listed.returncode == 0 and name in listed.stdout:
+        return
+    still = "; `session land` still runs it" if event == "pre-push" else ""
+    if git(repo, "config", "--get", "core.hooksPath", check=False):
+        print(f"note: {what} not activated (core.hooksPath is set and this git has no config hooks){still}")
+        return
+    shim = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "hooks" / event
+    if shim.exists():
+        if mark not in shim.read_text(errors="replace"):
+            print(f"note: {what} not activated (a {event} hook exists and this git has no config hooks){still}")
+        return
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text(f"#!/bin/sh\n{mark} (org-design-tooling/repo-kit)\n{cmd} \"$@\"\n")
+    shim.chmod(0o755)
 
 
 def activate_prepush(repo):
-    """Turn on .agents/hooks/pre-push for this clone without displacing any existing hook.
+    """Turn on every kit hook for this clone: the pre-push check and, since kit 28, the pre-commit guard."""
+    for name, event, what in HOOKS:
+        activate_hook(repo, name, event, what)
 
-    Git 2.54+ config hooks run beside the hook directory's own pre-push (Entire, a repo's
-    .githooks), so this only adds. On an older git, a .git/hooks/pre-push shim is written only
-    when core.hooksPath is unset and no pre-push hook exists. Same logic as repo-kit/install.py."""
-    have = git(repo, "config", "--get", f"hook.{HOOK_NAME}.command", check=False)
-    if have != HOOK_CMD:
-        git(repo, "config", f"hook.{HOOK_NAME}.event", "pre-push", check=False)
-        git(repo, "config", f"hook.{HOOK_NAME}.command", HOOK_CMD, check=False)
-    listed = run(["git", "hook", "list", "pre-push"], repo, check=False)
-    if listed.returncode == 0 and HOOK_NAME in listed.stdout:
-        return
-    if git(repo, "config", "--get", "core.hooksPath", check=False):
-        print("note: pre-push portability check not activated (core.hooksPath is set and this git has no "
-              "config hooks); `session land` still runs it")
-        return
-    shim = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")) / "hooks" / "pre-push"
-    if shim.exists():
-        if SHIM_MARK not in shim.read_text(errors="replace"):
-            print("note: pre-push portability check not activated (a pre-push hook exists and this git has no "
-                  "config hooks); `session land` still runs it")
-        return
-    shim.parent.mkdir(parents=True, exist_ok=True)
-    shim.write_text(f"#!/bin/sh\n{SHIM_MARK} (org-design-tooling/repo-kit)\n{HOOK_CMD} \"$@\"\n")
-    shim.chmod(0o755)
+
+# ---------------------------------------------------------------------------------------------------------
+# The commit guard (kit 28): `session commit-guard`, run by .agents/hooks/pre-commit before every commit.
+#
+# Two failures it closes, both recorded as signals before it existed:
+#   1. A commit on the primary checkout. On 2026-09-23 a session committed on the governance root's primary
+#      main and swept a stale index, eight paths another session had staged and walked away from, into a
+#      one-file change; main diverged, fixes already on origin were reverted locally, and every ff-only pull
+#      refused until it was re-pointed. The Claude Code write guard blocks edits into a primary, but a commit
+#      is a git command, which that guard never gates. Here: a commit in the primary checkout is refused,
+#      the index is left exactly as it was, and the message names the staged count and `session start`.
+#      A primary with no trunk yet (no origin/<base>, a repository being seeded) is not judged.
+#   2. Two sessions in one working tree. On 2026-08-27 two sessions worked the same clone; a checkout in one
+#      moved HEAD under the other, and from then on 25 commits from both landed on one branch in strict
+#      alternation while every push reported success. `start` now pins the worktree to its branch and to
+#      the session that started it (<git dir>/session-pin.json). A commit on another branch, or from another
+#      session while the pin names one, is refused with the move and the remedy.
+# Bypasses are per command, named in the refusal, and reported to Witness: SESSION_ALLOW_PRIMARY_COMMIT=1,
+# SESSION_ALLOW_BRANCH_CHANGE=1 (re-pins to the branch you are on), SESSION_ALLOW_SHARED_WORKTREE=1 (re-pins
+# to you; a hand-off from a session that is gone). Everything that goes wrong inside the guard fails open
+# (main() turns an uncaught exception into exit 0 for this verb): a guard bug must never wedge every commit.
+# ---------------------------------------------------------------------------------------------------------
+PIN_FILE = "session-pin.json"
+ALLOW_PRIMARY, ALLOW_BRANCH, ALLOW_SHARED = "SESSION_ALLOW_PRIMARY_COMMIT", "SESSION_ALLOW_BRANCH_CHANGE", "SESSION_ALLOW_SHARED_WORKTREE"
+GUARD_REASONS = ("primary_commit", "branch_moved", "second_session")
+
+
+def session_id():
+    """The identity of the session running this command, when its harness says: Claude Code sets
+    CLAUDE_CODE_SESSION_ID; SESSION_KIT_SESSION_ID is for any other harness (and the tests). None when unknown."""
+    return (os.environ.get("SESSION_KIT_SESSION_ID") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+            or os.environ.get("CLAUDE_SESSION_ID") or None)
+
+
+def pin_path(top):
+    """This worktree's own git dir, which no checkout, rebase or clean reaches (as kept_dir)."""
+    return Path(git(top, "rev-parse", "--path-format=absolute", "--git-dir", env=READ_ONLY)) / PIN_FILE
+
+
+def read_pin(top):
+    try:
+        return json.loads(pin_path(top).read_text())
+    except (OSError, ValueError, SystemExit):
+        return None
+
+
+def write_pin(top, branch, task=None, sid=None):
+    pin = {"branch": branch, "task": task, "session": sid,
+           "pinned": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
+    p = pin_path(top)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(pin, indent=2) + "\n")
+    return pin
+
+
+def short_id(sid):
+    return (sid or "unknown")[:8]
+
+
+def cmd_commit_guard(a):
+    """Exit 1 refuses the commit (git stops before it writes anything); 0 lets it go."""
+    top, primary, linked = here(a.here)
+    base = default_branch(primary)
+    branch = git(top, "branch", "--show-current", check=False, env=READ_ONLY) or "(detached)"
+    EVENT["attrs"].update(linked=linked, branch_kind="base" if branch == base else "other")
+    if not linked:
+        if not git(top, "rev-parse", "-q", "--verify", f"refs/remotes/origin/{base}", check=False, env=READ_ONLY):
+            EVENT["attrs"]["decision"] = "no_trunk"  # a repository being seeded: nothing to follow yet
+            return 0
+        staged = name_list(top, "--cached", check=False, env=READ_ONLY)
+        EVENT["attrs"]["staged"] = len(staged)
+        if os.environ.get(ALLOW_PRIMARY) == "1":
+            EVENT["attrs"]["bypass"] = "primary_commit"
+            print(f"session: committing on the primary checkout of {primary.name} ({branch}) under {ALLOW_PRIMARY}=1; "
+                  f"{len(staged)} staged path(s); reported to Witness", file=sys.stderr)
+            return 0
+        EVENT["attrs"]["reason"] = "primary_commit"
+        print(f"session: REFUSED: this is the primary checkout of {primary.name}, on {branch}, and no commit is made "
+              f"here (SESSIONS.md rule 1): every session shares it, and a commit here carries whatever anyone left "
+              f"staged.\n  Staged here now: {len(staged)} path(s) (`git status --short` names them); nothing was "
+              f"committed and the index is as it was.\n  Commit from a session worktree instead:\n"
+              f"    python3 {primary}/.agents/bin/session start <task> --own <path>\n  then make the change there "
+              f"(or `git stash push -u -m <tag>` here and apply it there), commit named files, and `session land`.\n"
+              f"  A deliberate exception, reported to Witness: {ALLOW_PRIMARY}=1 git commit ...", file=sys.stderr)
+        return 1
+    pin = read_pin(top)
+    if not pin:
+        EVENT["attrs"]["decision"] = "unpinned"  # a worktree made before kit 28, or by hand
+        return 0
+    sid = session_id()
+    if pin.get("branch") and pin["branch"] != branch:
+        if os.environ.get(ALLOW_BRANCH) == "1":
+            write_pin(top, branch, pin.get("task"), pin.get("session"))
+            EVENT["attrs"]["bypass"] = "branch_change"
+            print(f"session: this worktree was pinned to {pin['branch']} and is now on {branch}; re-pinned under "
+                  f"{ALLOW_BRANCH}=1, reported to Witness", file=sys.stderr)
+            return 0
+        EVENT["attrs"]["reason"] = "branch_moved"
+        print(f"session: REFUSED: this worktree was started on {pin['branch']} (task {pin.get('task') or 'unknown'}) "
+              f"and HEAD is now on {branch}. A checkout moved under this session: on 2026-08-27 two sessions in one "
+              f"working tree interleaved 25 commits onto one branch this way while every push said success.\n"
+              f"  If you did not move it, another session is working in this worktree: start your own with\n"
+              f"    python3 {primary}/.agents/bin/session start <task>\n  To go back: git switch {pin['branch']}\n"
+              f"  If the move was yours and deliberate: {ALLOW_BRANCH}=1 git commit ... (re-pins to {branch}, "
+              f"reported to Witness)", file=sys.stderr)
+        return 1
+    if pin.get("session") and sid and pin["session"] != sid:
+        if os.environ.get(ALLOW_SHARED) == "1":
+            write_pin(top, branch, pin.get("task"), sid)
+            EVENT["attrs"]["bypass"] = "shared_worktree"
+            print(f"session: this worktree was started by session {short_id(pin['session'])} and session "
+                  f"{short_id(sid)} is committing in it; re-pinned under {ALLOW_SHARED}=1, reported to Witness",
+                  file=sys.stderr)
+            return 0
+        EVENT["attrs"]["reason"] = "second_session"
+        print(f"session: REFUSED: this worktree belongs to session {short_id(pin['session'])} (task "
+              f"{pin.get('task') or 'unknown'}, branch {branch}) and session {short_id(sid)} is committing in it. "
+              f"Two live sessions in one working tree interleave their commits (2026-08-27, 25 commits on one branch).\n"
+              f"  Start your own worktree:\n    python3 {primary}/.agents/bin/session start <task>\n"
+              f"  If that session is gone and this is its hand-off: {ALLOW_SHARED}=1 git commit ... (re-pins this "
+              f"worktree to you, reported to Witness)", file=sys.stderr)
+        return 1
+    return 0
 
 
 PRE_LAND_TIMEOUT = 300       # seconds, for an entry that names none
@@ -726,6 +885,7 @@ def cmd_start(a):
         disk_guard(primary, wt.parent, f"origin/{base}", adopt=False)
         git(primary, "worktree", "add", "-q", "-b", branch, str(wt), f"origin/{base}")
     activate_prepush(primary)
+    write_pin(wt, branch, tid, session_id())  # the commit guard holds this worktree to this branch and session (kit 28)
     rel = os.path.relpath(wt, primary)
     (wt / ".agents" / "tasks").mkdir(parents=True, exist_ok=True)
     (wt / ".agents" / "handoffs").mkdir(parents=True, exist_ok=True)
@@ -733,6 +893,8 @@ def cmd_start(a):
             "worktree": rel, "base_commit": base_commit, "objective": a.objective or "",
             "owned_paths": a.own, "started": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
             "handoff": f".agents/handoffs/{tid}.md"}
+    if a.robot:  # a scheduled job's run: the reaper retires it once a later run supersedes it (kit 29)
+        task["robot"] = True
     (wt / ".agents" / "tasks" / f"{tid}.json").write_text(json.dumps(task, indent=2) + "\n")
     tmpl = wt / ".agents" / "HANDOFF.template.md"
     body = tmpl.read_text() if tmpl.exists() else "# Agent handoff: <task>\n"
@@ -835,13 +997,18 @@ def cmd_status(a):
     EVENT["attrs"].update(sessions=len(ss), overlaps=len(ov))
     pbranch = git(primary, "branch", "--show-current", check=False) or "(detached)"
     pdirty = len(git(primary, "status", "--porcelain", check=False, env=READ_ONLY).splitlines())
+    pstaged = name_list(primary, "--cached", check=False, env=READ_ONLY)  # a stale index, named (kit 28)
     pbehind = primary_behind(primary, base)
     if a.json:
         print(json.dumps({"primary": str(primary), "primary_branch": pbranch, "primary_dirty": pdirty,
-                          "primary_behind": pbehind, "sessions": ss, "overlaps": ov}, indent=2))
+                          "primary_staged": pstaged, "primary_behind": pbehind, "sessions": ss, "overlaps": ov}, indent=2))
         return 1 if ov else 0
     print(f"primary: {primary}  on {pbranch}, {pdirty} uncommitted path(s)" +
           ("" if pbranch == base else f"  WARNING: primary should be on {base}"))
+    if pstaged:
+        print(f"primary: WARNING: {len(pstaged)} path(s) STAGED and not committed {names(pstaged)}: a stale index; "
+              f"a commit here would sweep them in (the commit guard refuses one; the session that staged them should "
+              f"`git restore --staged` or stash them by tag)")
     print(f"primary: {pbehind} behind origin/{base}" +
           ("" if pbehind == 0 else "  (run `session finish` for a landed session, or wait for the hub's primary-ff sweep)"))
     if not ss:
@@ -1117,6 +1284,7 @@ def cmd_land(a):
     top, primary, linked = here(a.here)
     if not linked:
         sys.exit("session: land runs inside a session worktree, not the primary checkout")
+    os.environ[WIP_SWITCH] = "0"  # land's own commits (the close, a rebase's replays) push no backup ref
     base = default_branch(primary)
     if git(top, "status", "--porcelain", "--untracked-files=no", env=READ_ONLY):
         sys.exit("session: commit or set aside your tracked changes first (never stash another session's work)")
@@ -1192,6 +1360,7 @@ def cmd_land(a):
                 EVENT["attrs"]["route"] = "local"
                 print(f"landed locally as {squash[:8]} on origin/{base} (no PR, no CI run)")
                 kf11_record(primary, kf_agent, branch, kf_content)
+                drop_wip(top, branch)  # landed: the backup ref has done its job (kit 29)
                 # the branch follows its squash (same tree): a later land replays only what is new
                 follow(top, squash, head, base)
                 ff_primary(primary, base)
@@ -1248,6 +1417,7 @@ def cmd_land(a):
     state, armed, merged = (info + ["", "", ""])[:3]
     if state == "MERGED":
         print("PR merged.")
+        drop_wip(top, branch)
         ff_primary(primary, base)
         if not (merged and follow(top, merged, head, base)):
             print("branch still carries the merged commits (the squash is not this head's tree); "
@@ -1263,16 +1433,21 @@ def cmd_land(a):
     return 0
 
 
+def pick_worktree(primary, linked, top, task, verb):
+    """The worktree a finish or retire acts on: the one the shell is in, or from the primary the one --task names."""
+    if linked:
+        return top
+    cands = [s for s in sessions(primary) if task and task in (s["branch"] + s["task"] + s["path"])]
+    if len(cands) != 1:
+        sys.exit(f"session: from the primary checkout, name the session with --task (it matched {len(cands)})")
+    return Path(cands[0]["path"])
+
+
 def cmd_finish(a):
     top, primary, linked = here(a.here)
+    os.environ[WIP_SWITCH] = "0"
     base = default_branch(primary)
-    if linked:
-        wt = top
-    else:
-        cands = [s for s in sessions(primary) if a.task and a.task in (s["branch"] + s["task"] + s["path"])]
-        if len(cands) != 1:
-            sys.exit("session: from the primary checkout, name the session with --task")
-        wt = Path(cands[0]["path"])
+    wt = pick_worktree(primary, linked, top, a.task, "finish")
     branch = git(wt, "branch", "--show-current")
     git(primary, "fetch", "-q", "--prune", "origin")
     st, pr_head = (run(["gh", "pr", "view", branch, *gh_repo(wt), "--json", "state,headRefOid", "-q",
@@ -1292,6 +1467,7 @@ def cmd_finish(a):
                  "worktree would delete that copy. Merge it by hand, delete the kept copy, then finish again")
     if git(wt, "status", "--porcelain", env=READ_ONLY):
         sys.exit(f"session: {wt} has uncommitted changes; they are not yours to discard")
+    drop_wip(primary, branch)  # its work is on main: the backup ref goes (kit 29)
     ff_primary(primary, base)
     if "/.claude/worktrees/" in str(wt):
         print(f"left {wt} in place: the desktop app owns that worktree")
@@ -1303,12 +1479,143 @@ def cmd_finish(a):
     return 0
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Backups and retirement (kit 29).
+#
+# On 2026-10-23 twenty worktrees had sat 3 to 20 days with work that existed only on Aurelius's disk, one of
+# them the only copy of a client chat extract: their sessions ended before `land` (killed, rate-limited, a
+# person walked away, a scheduled job failed), a kit branch is never pushed before land, and the hourly reaper
+# rightly refuses to remove unlanded work but said so only in a log nobody reads.
+#   - Backup on every commit: .agents/hooks/post-commit starts `session wip-backup` in the background, which
+#     force-pushes the branch tip to origin as refs/wip/<branch>. GitHub accepts a ref outside refs/heads and
+#     refs/tags, lists it as no branch and runs no workflow for it (probed on theparlor/org-design-tooling,
+#     whose workflow runs on every push, 2026-10-23). Only agent/* and claude/* branches; never the trunk.
+#     Fail-open and quiet: a commit never waits on it or fails for it; offline it simply fails. git push over
+#     ssh is all it needs (no gh), so it works on a machine where gh does not.
+#   - `land`, `finish` and `retire` (and the reaper's retirements) delete the backup ref.
+#   - `session retire`: retirement.retire() (beside this script) snapshots everything uncommitted into one
+#     commit, tags it archive/<branch>-<date>, pushes the tag, lands a ledger row and manifest, and removes
+#     the worktree. The reaper calls the same routine for a robot's superseded run.
+# ---------------------------------------------------------------------------------------------------------
+WIP_SWITCH = "SESSION_WIP_BACKUP"  # "0" turns the backup push off for one command (land, finish, retire set it)
+WIP_BRANCHES = ("agent/", "claude/")
+WIP_TIMEOUT = 90  # seconds a backup push may take before it is given up
+
+
+def wip_ref(branch):
+    return f"refs/wip/{branch}"
+
+
+def drop_wip(cwd, branch):
+    """Delete the branch's backup ref on origin. Quiet and fail-open: a missing ref or no network is fine."""
+    if not branch or not branch.startswith(WIP_BRANCHES):
+        return
+    try:
+        subprocess.run(["git", "push", "-q", "origin", f":{wip_ref(branch)}"], cwd=cwd, capture_output=True,
+                       timeout=60, env=wip_env())
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def wip_env():
+    """No prompt, and an ssh that gives up quickly when the network is gone, unless ssh is configured already."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="true", SSH_ASKPASS="true")
+    if not (env.get("GIT_SSH_COMMAND") or env.get("GIT_SSH")):
+        env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=15"
+    return env
+
+
+def cmd_wip_backup(a):
+    """Push this branch's tip to origin as refs/wip/<branch>. Always exits 0: a backup never fails a commit."""
+    top, primary, linked = here(a.here)
+    branch = git(top, "branch", "--show-current", check=False, env=READ_ONLY)
+    if os.environ.get(WIP_SWITCH, "").strip() == "0":
+        EVENT["attrs"]["decision"] = "disabled"
+        return 0
+    if not branch.startswith(WIP_BRANCHES):
+        EVENT["attrs"]["decision"] = "not_a_session_branch"
+        return 0
+    lock = Path(git(top, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)) / "wip-backup.lock"
+    import fcntl
+    with open(lock, "a") as fh:
+        deadline = time.monotonic() + WIP_TIMEOUT
+        while True:  # one push at a time per clone; the one that waited pushes the newest tip
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    EVENT["attrs"]["decision"] = "lock_timeout"
+                    return 0
+                time.sleep(0.2)
+        try:
+            r = subprocess.run(["git", "push", "-q", "origin", f"+refs/heads/{branch}:{wip_ref(branch)}"], cwd=top,
+                               capture_output=True, text=True, timeout=WIP_TIMEOUT, env=wip_env())
+            err, rc = (r.stderr or r.stdout).strip(), r.returncode
+        except subprocess.TimeoutExpired:
+            err, rc = "timed out", 124
+        except OSError as e:
+            err, rc = str(e), 127
+    if rc == 0:
+        EVENT["attrs"]["decision"] = "pushed"
+    else:
+        EVENT["outcome"] = "error"
+        EVENT["attrs"]["decision"] = ("offline" if re.search(r"resolve host|timed out|Network is unreachable|"
+                                                             r"Connection refused", err, re.I)
+                                      else "archived" if re.search(r"archived|read-only", err, re.I) else "push_failed")
+        if not a.quiet:
+            print(f"session: backup push of {branch} failed: {' '.join(err.split())[:200]}", file=sys.stderr)
+    return 0
+
+
+def load_retirement():
+    """retirement.py beside this script (kit 29): the routine and record format shared with the worktree reaper."""
+    src = Path(__file__).resolve().parent / "retirement.py"
+    if not src.is_file():
+        sys.exit(f"session: {src} is missing; reinstall the session kit (kit 29 or later)")
+    spec = importlib.util.spec_from_file_location("session_kit_retirement", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def cmd_retire(a):
+    """Keep abandoned or superseded work on a pushed archive tag with a ledger row, then remove the worktree."""
+    top, primary, linked = here(a.here)
+    os.environ[WIP_SWITCH] = "0"
+    wt = pick_worktree(primary, linked, top, a.task, "retire")
+    rt = load_retirement()
+    kind = "desktop" if "/.claude/worktrees/" in str(wt) else "kit"
+    if not a.dry_run:
+        os.chdir(primary)  # never remove the directory we are standing in
+    rec = rt.retire(primary, wt, base=default_branch(primary), reason=a.reason or "retired by hand",
+                    source="session-retire", kind=kind, dry_run=a.dry_run)
+    EVENT["attrs"].update(action=rec["action"], snapshot_files=len(rec.get("snapshot") or []),
+                          archived=bool(rec.get("archived")), route=rec.get("route", ""),
+                          freed_mb=rec.get("freed_mb") or 0, dry_run=bool(a.dry_run))
+    if rec["action"] == "would-retire":
+        print(f"would retire {wt}: {rec['reason']}; nothing changed (dry run)")
+        return 0
+    if rec["action"] != "retired":
+        EVENT["attrs"]["reason"] = "retire_" + rec["action"]
+        EVENT["outcome"] = "blocked" if rec["action"] == "refused" else "error"
+        print(f"session: retire {rec['action']}: {rec['reason']}\nNothing was removed; {wt} is as it was"
+              + (" apart from what the message names" if rec["action"] == "error" else ""), file=sys.stderr)
+        return 1
+    where = ("tag kept LOCAL (origin is archived); ledger row in the Workspaces root" if rec.get("archived")
+             else f"tag pushed; ledger row {'landed' if rec.get('route') == 'pushed' else 'in PR ' + str(rec.get('record'))}")
+    print(f"retired {wt}\n  tag: {rec['tag']} ({where})\n  snapshot: {len(rec['snapshot'])} uncommitted path(s) "
+          f"folded in\n  recover: git checkout -b {rec.get('branch') or '<branch>'} {rec['tag']}")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(prog="session", description="Parallel sessions: see .agents/SESSIONS.md")
     sub = p.add_subparsers(dest="cmd", required=True)
     other = "act on the repository the shell is in even though this script belongs to another one (kit 17)"
     s = sub.add_parser("start"); s.add_argument("task"); s.add_argument("--own", action="append", default=[])
     s.add_argument("--provider"); s.add_argument("--objective")
+    s.add_argument("--robot", action="store_true", help="a scheduled job's run: the reaper retires it once a later run of the same job supersedes it (kit 29)")
     s.add_argument("--here", action="store_true", help="adopt the session worktree you are in (the desktop app's .claude/worktrees/<name>) instead of cutting a sibling; the repository it belongs to is the one meant, even if this script belongs to another")
     s = sub.add_parser("status"); s.add_argument("--json", action="store_true")
     s.add_argument("--here", action="store_true", help=other)
@@ -1319,15 +1626,34 @@ def main():
     s.add_argument("--here", action="store_true", help=other)
     s = sub.add_parser("finish"); s.add_argument("--task")
     s.add_argument("--here", action="store_true", help=other)
+    s = sub.add_parser("commit-guard", help="run by .agents/hooks/pre-commit: refuse a commit on the primary checkout, on a branch this worktree was not started on, or from a second session (kit 28)")
+    s.add_argument("--here", action="store_true", help=other)
+    s = sub.add_parser("retire", help="keep abandoned or superseded work on a pushed archive tag with a ledger row, then remove the worktree (kit 29)")
+    s.add_argument("--reason", help="why, in a few words: it goes into the ledger row and the manifest")
+    s.add_argument("--task", help="from the primary checkout: the session to retire")
+    s.add_argument("--dry-run", action="store_true", help="check and report; change nothing")
+    s.add_argument("--here", action="store_true", help=other)
+    s = sub.add_parser("wip-backup", help="run by .agents/hooks/post-commit: push the branch tip to origin as refs/wip/<branch> (kit 29)")
+    s.add_argument("--quiet", action="store_true", help="say nothing even when the push fails")
+    s.add_argument("--here", action="store_true", help=other)
     a = p.parse_args()
     started, code = time.monotonic(), "uncaught exception"
     EVENT["verb"] = a.cmd
+    verbs = {"start": cmd_start, "status": cmd_status, "land": cmd_land, "finish": cmd_finish,
+             "commit-guard": cmd_commit_guard, "retire": cmd_retire, "wip-backup": cmd_wip_backup}
     try:
-        code = {"start": cmd_start, "status": cmd_status, "land": cmd_land, "finish": cmd_finish}[a.cmd](a) or 0
+        code = verbs[a.cmd](a) or 0
         return code
     except SystemExit as e:
         code = e.code
         raise
+    except Exception as e:
+        if a.cmd != "commit-guard":
+            raise
+        code = 0  # the guard fails open: a bug in it must never wedge every commit in every repo
+        EVENT["attrs"].update(decision="fail_open", error=type(e).__name__)
+        print(f"session: commit-guard error ({type(e).__name__}); the commit goes on", file=sys.stderr)
+        return 0
     finally:
         witness_report(a.cmd, code, started)
 
