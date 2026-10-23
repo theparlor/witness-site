@@ -15,8 +15,13 @@ Only the change's own task record (the one naming the branch) counts as the chan
 record the change closes is not (kit 26). A task record with a live status whose worktree and branch are both gone is a stale lock (kit 24): it is
 named in a warning at every land, and an ownership overlap it causes says so, with the fix. It still
 counts in the overlap check, because a session on another machine has no worktree or branch here either.
+
+Declared registers (csv_unique_key in the policy, kit 27): every CSV the change touches that matches a declared
+glob must keep a unique key, must not carry its header again as a data row, and must not repeat a row under a
+second key. A land whose rebase conflict covered a whole appended register pushed exactly that shape on 2026-09-26
+(header swallowed as a data row, 31 rows renumbered and kept twice) while this audit reported no findings.
 """
-import argparse, fnmatch, json, os, subprocess, sys
+import argparse, csv, fnmatch, json, os, subprocess, sys
 from pathlib import Path
 
 def git(root, *args, check=True):
@@ -73,6 +78,39 @@ def head_blobs(root):
         if len(meta) == 3: out.add(meta[2])
     return out
 
+def csv_rules():
+    """The declared registers: each entry a glob (key in the first column) or {"glob": ..., "key_column": n}."""
+    out = []
+    for e in POLICY.get("csv_unique_key", []):
+        if isinstance(e, str): out.append((e, 0))
+        elif isinstance(e, dict) and isinstance(e.get("glob"), str):
+            out.append((e["glob"], int(e.get("key_column", 0))))
+    return out
+
+def csv_findings(path, keycol):
+    """Findings for one declared register; empty when it passes. Three shapes, each one a bad merge leaves:
+    the header again as a data row (judged on the cells beside the key, because a resolver may renumber it),
+    a key used twice, and one row kept twice under two keys."""
+    try:
+        with open(path, newline="", encoding="utf-8") as fh: rows = list(csv.reader(fh))
+    except Exception as e:
+        return [f"unreadable: {e}"]
+    rows = [r for r in rows if r]
+    if not rows: return []
+    header, out, keys, bodies = rows[0], [], {}, {}
+    rest = [c for i, c in enumerate(header) if i != keycol]
+    for n, r in enumerate(rows[1:], start=2):
+        others = [c for i, c in enumerate(r) if i != keycol]
+        if r == header or (rest and sum(a == b for a, b in zip(others, rest)) * 2 >= len(rest)):
+            out.append(f"line {n}: the header repeated as a data row"); continue
+        k = r[keycol] if len(r) > keycol else ""
+        if k in keys: out.append(f"line {n}: duplicate key {k!r} (first at line {keys[k]})")
+        else: keys[k] = n
+        body = tuple(others)
+        if any(body) and body in bodies: out.append(f"line {n}: row {k!r} repeats line {bodies[body]} under another key")
+        else: bodies.setdefault(body, n)
+    return out
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--preflight", action="store_true")
@@ -102,7 +140,7 @@ def main():
                 altered.add(parts[1])
     if a.path:
         changed = [x for x in changed if any(x == q.rstrip("/") or x.startswith(q.rstrip("/") + "/") for q in a.path)]
-    errors, warnings = [], []
+    errors, warnings, notes = [], [], []
     linked = Path(git(ROOT, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()).parent.resolve() != ROOT.resolve()
     if a.preflight:
         if changed: warnings.append(f"worktree has {len(changed)} changed paths; treat them as user-owned")
@@ -143,6 +181,18 @@ def main():
                 if f.suffix not in POLICY.get("non_durable_path_scan_suffixes", []) or not f.is_file(): continue
                 if pat in f.read_text(errors="ignore"):
                     errors.append(f"non-durable path literal {pat!r} in {x}: a session scratch directory does not outlive its session")
+        rules = csv_rules()
+        if rules:
+            checked = 0
+            for x in changed:
+                rule = next((r for r in rules if match(x, r[0])), None)
+                if rule is None or not (ROOT / x).is_file(): continue
+                checked += 1
+                found = csv_findings(ROOT / x, rule[1])
+                if found:
+                    errors.append(f"csv_unique_key: {x} has {len(found)} finding(s): " + "; ".join(found[:5]) +
+                                  ("" if len(found) <= 5 else f"; and {len(found) - 5} more"))
+            notes.append(f"csv_unique_key: {checked} declared register(s) in this change checked")
         if changed and not any(x.startswith(".agents/handoffs/") for x in changed):
             warnings.append("no task handoff is present in the change set")
         # Only an overlap involving this change's own task blocks; older overlaps are reported, not fatal.
@@ -178,6 +228,7 @@ def main():
                                             "complete in a session of its own, then land again)")
                             (errors if (mine and {left.get('id'), right.get('id')} & mine) else warnings).append(msg)
     print(f"repository: {ROOT}\nbranch: {branch}\nchanged paths: {len(changed)}")
+    for x in notes: print("checked:", x)
     for x in errors: print("ERROR:", x)
     for x in warnings: print("WARNING:", x)
     if not errors and not warnings: print("OK: no findings")

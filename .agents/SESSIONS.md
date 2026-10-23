@@ -122,6 +122,16 @@ After the merge: fast-forwards the primary checkout, removes your worktree (only
 clean) and deletes the local branch.
 
 ```bash
+python3 .agents/bin/session retire --reason "<why, in a few words>"
+```
+
+For work that will not land: abandoned, superseded, or a run that failed half way. Run inside the
+worktree (or from the primary with `--task`). Everything uncommitted becomes one snapshot commit, the
+tip is tagged `archive/<branch>-<date>` and the tag pushed, a ledger row and manifest land on main, and
+the worktree and its local branch are removed. Nothing is lost: the manifest names the recover command
+(`git checkout -b <branch> <tag>`). `--dry-run` checks and changes nothing. Kit 29, below.
+
+```bash
 python3 .agents/bin/agent_repo_audit.py --check
 ```
 
@@ -170,6 +180,25 @@ Keep them fast and local: they run on every land of every session. Cast's is its
 `gate`-marked tests (`engine/scripts/gate_tests.py`, under a minute, no model call, no
 network), added after a test encoding a pipeline invariant stayed red on every branch for
 four days in September 2026.
+
+### Declared registers keep a unique key (kit 27)
+
+A repository that keeps registers as CSV files (one row per thing, a key in one column) can
+declare them under `csv_unique_key` in `.agents/repository-policy.json`:
+
+```json
+"csv_unique_key": [{"glob": "Inventory/photos/index.csv", "key_column": 1}, "Inventory/*.csv"]
+```
+
+A plain glob keys on the first column; the first entry a path matches wins, so list the specific
+ones first. The audit that `session land` runs then refuses any declared CSV the change touches
+that has a key used twice, its header again as a data row (judged on the cells beside the key,
+because a resolver may have renumbered it), or one row kept twice under two keys. Those are the
+three marks a rebase conflict over a whole appended register leaves: on 2026-09-26 a land pushed
+a plan register with its header as a data row and 31 rows kept twice, and the audit reported no
+findings. The audit line reads `checked: csv_unique_key: N declared register(s) in this change
+checked`. Registers the change did not touch are not judged, so older debt never blocks an
+unrelated land. The default is none.
 
 ### A land never reverts another session's landing (kit 19)
 
@@ -257,10 +286,101 @@ Today it is advisory and the land goes on. To land for review, run
 `SESSION_KF11_ENFORCE=1`, or `"kf11": {"enforce": true}` in `.agents/repository-policy.json`, turns
 the advisory into a refusal (exit status 1, nothing pushed) of every route but `--no-merge`.
 
+### No commit on the primary, and one session per working tree (kit 28)
+
+Two failures the kit's own hooks did not reach until now, both recorded as signals first.
+
+On 23 September 2026 a session committed directly on a primary main. The commit was meant to carry
+one file; it carried nine, because an earlier session had staged a pre-fix state of eight paths and
+walked away, and `git commit` commits whatever is staged. Fixes already on origin were reverted
+locally and every fast-forward pull on that machine refused until main was re-pointed. The Claude
+Code write guard blocks edits into a primary, but a commit is a git command, which it never gates.
+
+On 27 August 2026 two sessions worked one clone. A checkout in the second moved HEAD under the
+first, and from then on 25 commits from both sessions landed on one branch in strict alternation,
+each authored believing it was on its own branch, while `git push <branch>` reported success for an
+hour pushing a branch that had not moved.
+
+Now `.agents/hooks/pre-commit` runs `session commit-guard` before every commit, activated per clone
+beside the pre-push check (config hook `session-kit-commit-guard`; a shim on an older git only where
+no pre-commit hook exists). It refuses, exit status 1, nothing written, the index as it was:
+
+- **a commit in the primary checkout** (rule 1), naming how many paths are staged there and the
+  `session start` to run instead. A repository with no `origin/<base>` yet (one being seeded) is not
+  judged. `session status` now also names paths staged on the primary, so a stale index is a
+  visible finding and not a trap for the next commit.
+- **a commit on a branch this worktree was not started on.** `start` pins the worktree to its branch
+  and to the session that started it (`<git dir>/session-pin.json`, for a sibling worktree and an
+  adopted desktop-app worktree alike). A commit on any other branch is the 27 August move, and the
+  message says how to go back (`git switch <pinned branch>`).
+- **a commit from a second session** while the pin names the first (Claude Code's
+  `CLAUDE_CODE_SESSION_ID`; `SESSION_KIT_SESSION_ID` for any other harness). With no identity on
+  either side nothing is judged.
+
+Each bypass is for one command, named in the refusal, and reported to Witness:
+`SESSION_ALLOW_PRIMARY_COMMIT=1`; `SESSION_ALLOW_BRANCH_CHANGE=1` (re-pins to the branch you are
+on); `SESSION_ALLOW_SHARED_WORKTREE=1` (re-pins the worktree to you: a hand-off from a session that
+is gone). `session land` run by a session other than the one that started the worktree treats its
+close commit as that hand-off, says so, and goes on. A worktree without a pin (made before kit 28,
+or by hand) commits as before. The guard fails open on its own errors and when python3 is missing;
+its Witness event (`org_design_tooling.session_kit`, verb `commit-guard`) carries the outcome, the
+reason or bypass, whether the checkout is linked and the staged count, never a path.
+
+### Unlanded work is backed up, retired on purpose, and never stuck in silence (kit 29)
+
+On 23 October 2026 twenty session worktrees had sat 3 to 20 days with commits that existed only on one
+machine's disk; one held the only copy of a client chat extract. Their sessions had ended before
+`session land` (killed, rate-limited, a person walked away, a scheduled job failed), a session branch is
+never pushed before land, and the hourly worktree reaper rightly refused to remove unlanded work but said
+so only in a log nobody reads. Four changes:
+
+- **A backup after every commit.** `.agents/hooks/post-commit` (config hook `session-kit-wip-backup`,
+  beside any post-commit hook the repo has) starts `session wip-backup` in the background after every
+  commit on an `agent/*` or `claude/*` branch. It pushes the branch tip to origin as
+  `refs/wip/<branch>`. That is a backup, not a landing: GitHub lists a ref outside `refs/heads` as no
+  branch and runs no workflow for it (probed 2026-10-23 on a repo whose workflow runs on every push), and
+  the pre-push check skips backup refs and archive tags. A commit never waits for it and never fails for
+  it; offline the push simply fails, quietly. It needs only `git push` (no `gh`).
+  `SESSION_WIP_BACKUP=0` turns it off for one command. `land`, `finish` and `retire` delete the ref.
+- **`session retire`** (the command above) is the manual path for work that will not land. It refuses,
+  changing nothing, while a rebase or merge is in progress, while a stopped land keeps copies aside, when
+  an uncommitted file is over 100 MB (GitHub refuses one; each is named), or when an ignored file differs
+  from the primary's copy. Ignored files the primary lacks are moved there; regenerable ones (`.venv`,
+  `node_modules`, caches) go with the worktree. The task record is marked `retired` inside the snapshot.
+  The snapshot is built with a temporary index, so no hook can leave it half staged; it never lands on
+  main. Where GitHub has archived the origin (read-only), the tag stays local and the ledger row and
+  manifest land in the Workspaces root's `.intent/retirements/` instead. The routine and record format
+  live in `.agents/bin/retirement.py`, shared with the reaper.
+- **Robot runs.** A scheduled job's session is a robot's when its task name (the branch's last segment
+  without the `YYYY-MM-DD-` the kit adds) starts with a prefix listed in this repo's
+  `.agents/repository-policy.json`, or when it was started with `session start <task> --robot`
+  (which writes `"robot": true` into the task record):
+
+  ```json
+  "robot_tasks": ["nightly-freshen", "auto-library-watch"]
+  ```
+
+  The reaper reads the list from `origin/main`, so land the policy change first. A robot's worktree that
+  is unlanded (or holds uncommitted work), idle a day and superseded (a later run of the same prefix has
+  its own worktree, or a later run's task record is already on main) is retired by the reaper through the
+  same routine, with a ledger row. One that is not superseded is reported as stuck (next point).
+- **Stuck worktrees are said out loud.** Every reaper run rewrites
+  `<Workspaces>/.intent/observability/stuck-worktrees.json` with each worktree left unlanded or refused for
+  over 48 hours (a robot's after 24): where it is, its branch, how long idle, why, how many commits are on
+  no origin branch, whether its backup ref is current, and the next command (`session land`, or
+  `session retire` for leftover files on landed work). A Claude Code SessionStart hook prints a block of
+  at most 12 lines from it, headed `STUCK WORKTREES (N)`, at the start of every session.
+
+The reaper also counts more landings as landed: every commit patch-equivalent to one on main
+(`git cherry`), or the branch's whole change equal by patch id to one commit on main (a squash pull
+request that later commits changed again).
+
 ## What the hooks enforce
 
 A Claude Code hook blocks Write and Edit into the primary checkout of any repo that carries
 this file. Another blocks `git worktree add` to anywhere but the sibling pattern (the desktop
 app makes its worktrees outside that hook, which is why they are the second valid place). Both
-print the command to run instead. A repo may add a commit-time backstop of its own (one engagement
-repo's pre-commit does); it must admit both valid places.
+print the command to run instead. The kit's own git pre-commit hook (kit 28, above) is the
+commit-time backstop for every clone: it admits both valid places and refuses the primary. A repo
+may add a pre-commit of its own beside it (one engagement repo's checks ownership); a config hook
+runs beside it, never instead of it.

@@ -1,0 +1,27 @@
+#!/bin/sh
+# Session kit post-commit backup (kit 29). Managed by org-design-tooling/repo-kit; overwritten on every kit update.
+#
+# After every commit on a session branch (agent/* or claude/*), starts `.agents/bin/session wip-backup` in the
+# background. That pushes the branch tip to origin as refs/wip/<branch>: a backup, never a landing. GitHub runs no
+# workflow for a ref outside refs/heads and refs/tags and lists it as no branch. On 2026-10-23 twenty worktrees held
+# work that existed only on one machine's disk, because a kit branch is never pushed before `session land` and their
+# sessions ended first. `session land`, `finish` and `retire` delete the backup ref.
+# Activated per clone by `session start`, `session land` or install.py as a git config hook:
+#   hook.session-kit-wip-backup.event   = post-commit
+#   hook.session-kit-wip-backup.command = test ! -f .agents/hooks/post-commit || sh .agents/hooks/post-commit
+# beside any post-commit hook the repo has; on a git before 2.54 a .git/hooks/post-commit shim, only where none exists.
+# Never blocks or fails a commit: it returns at once, the push runs detached and quiet, and offline it just fails.
+# SESSION_WIP_BACKUP=0 turns it off for one command.
+[ "${SESSION_WIP_BACKUP:-1}" = "0" ] && exit 0
+branch=$(git symbolic-ref --short -q HEAD 2>/dev/null) || exit 0
+case "$branch" in
+  agent/*|claude/*) ;;
+  *) exit 0 ;;
+esac
+top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+py=$(command -v python3) || exit 0
+script="$top/.agents/bin/session"
+[ -f "$script" ] || exit 0
+unset GIT_INDEX_FILE  # a partial commit's temporary index is gone by the time the push runs
+( cd "$top" && "$py" "$script" wip-backup --quiet </dev/null >/dev/null 2>&1 & ) >/dev/null 2>&1
+exit 0
