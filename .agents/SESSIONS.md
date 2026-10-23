@@ -344,8 +344,9 @@ so only in a log nobody reads. Four changes:
   `SESSION_WIP_BACKUP=0` turns it off for one command. `land`, `finish` and `retire` delete the ref.
 - **`session retire`** (the command above) is the manual path for work that will not land. It refuses,
   changing nothing, while a rebase or merge is in progress, while a stopped land keeps copies aside, when
-  an uncommitted file is over 100 MB (GitHub refuses one; each is named), or when an ignored file differs
-  from the primary's copy. Ignored files the primary lacks are moved there; regenerable ones (`.venv`,
+  an uncommitted file is over 100 MB (GitHub refuses one; each is named), or when more than 2 GB of ignored
+  files would need comparing. Ignored files the primary lacks are moved there; where both hold a different
+  copy, the newer takes the primary's path and the older is archived (kit 31, below); regenerable ones (`.venv`,
   `node_modules`, caches) go with the worktree. The task record is marked `retired` inside the snapshot.
   The snapshot is built with a temporary index, so no hook can leave it half staged; it never lands on
   main. Where GitHub has archived the origin (read-only), the tag stays local and the ledger row and
@@ -373,6 +374,11 @@ so only in a log nobody reads. Four changes:
 
 Kit 30: a worktree the reaper fails on for over 48 hours is listed too, and an empty folder that git's
 untracked cache still lists no longer blocks a retirement.
+
+Kit 31: when a worktree and the primary hold different copies of an ignored file, the newer copy takes the
+primary's path at retirement (by `session retire` or the reaper), and the older is kept in a local archive,
+`.agents/residue/<worktree>/ignored-copies-<date>.tar.gz`, which git ignores through this clone's
+`info/exclude`. Nothing is dropped, and the manifest names the archive.
 
 The reaper also counts more landings as landed: every commit patch-equivalent to one on main
 (`git cherry`), or the branch's whole change equal by patch id to one commit on main (a squash pull

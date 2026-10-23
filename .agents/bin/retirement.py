@@ -19,7 +19,9 @@ retire() in order, refusing before it changes anything:
      progress and nothing kept aside by a stopped `session land` (session-kept);
   2. no uncommitted file over 100 MB (MAX_FILE_BYTES): GitHub refuses one, so each is named and nothing is done;
   3. ignored files outside the regenerable set (.venv, node_modules, caches) are moved to the primary when it has
-     none there; a different copy already in the primary refuses, naming the path;
+     none there; where the primary holds a different copy, the newer of the two takes the primary's path and the
+     older goes into an archive kept beside the record (keep_aside, kit 31); only more ignored bytes than
+     LARGE_IGNORED_BYTES to compare refuses, naming the paths;
   4. the task record naming the branch is set to status "retired", then everything uncommitted (`git add -A`,
      ignored files excepted) becomes one snapshot commit on the branch, built with a temporary index and
      commit-tree like the reaper's record commit, so no hook can leave it half staged; it is an archive commit and
@@ -33,16 +35,19 @@ land in the Workspaces root's .intent/retirements/ instead (the first ancestor o
 checkout, or $WORKSPACES_ROOT), so a retirement there neither fails nor repeats.
 """
 import filecmp
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import tarfile
 from datetime import datetime
 from pathlib import Path
 
 GIT_TIMEOUT = 120
 MAX_FILE_BYTES = 100 * 1024 * 1024  # GitHub refuses a file over 100 MB
+KEEP_ASIDE_SLACK_S = 60  # copies modified within a minute of each other count as the same age: the primary's stays
 LARGE_IGNORED_BYTES = 2 << 30  # comparing more ignored bytes than this against the primary is left to a person
 LEDGER = ".intent/retirements/LEDGER.md"
 RESIDUE = ".agents/residue"
@@ -234,8 +239,8 @@ def commit_info(wt, base):
 
 
 def empty_residue():
-    return {"shard": [], "record": [], "probe": [], "on_main": [], "carry": [], "dup": [], "dropped": 0, "work": [],
-            "snapshot": []}
+    return {"shard": [], "record": [], "probe": [], "on_main": [], "carry": [], "dup": [], "replace": [], "aside": [],
+            "dropped": 0, "work": [], "snapshot": []}
 
 
 def residue_count(r):
@@ -258,6 +263,11 @@ def manifest_section(c):
     if r.get("carry"):
         kept.append(f"{len(r['carry'])} gitignored file(s) moved to the same path in the primary checkout: "
                     + ", ".join(f"`{p}`" for p in r["carry"][:20]) + (" and more" if len(r["carry"]) > 20 else ""))
+    if r.get("replace") or r.get("aside"):
+        kept.append(f"{len(r.get('replace', []))} gitignored file(s) newer in the worktree took their place in the "
+                    f"primary checkout and {len(r.get('aside', []))} older worktree copy(ies) were set aside; every "
+                    f"copy that lost its place is in `{c.get('aside_archive', '')}` (local, excluded from git; "
+                    "replaced-in-primary/ and from-worktree/ inside)")
     if r.get("on_main") or r.get("dup"):
         kept.append(f"{len(r.get('on_main', [])) + len(r.get('dup', []))} file(s) already identical on main or in "
                     "the primary")
@@ -472,10 +482,14 @@ def same_file(a, b):
 
 
 def ignored_plan(primary, wt):
-    """{"carry": [...], "dup": [...], "dropped": n, "work": [...]}: what happens to each ignored file. carry: moved
-    to the primary, which has none there; dup: the primary's copy is identical; dropped: regenerable; work: a
-    different copy is already in the primary, or too much to compare (a person decides)."""
-    res = {"carry": [], "dup": [], "dropped": 0, "work": []}
+    """{"carry", "dup", "replace", "aside": [...], "dropped": n, "work": [...]}: what happens to each ignored file.
+    carry: moved to the primary, which has none there; dup: the primary's copy is identical; replace: the primary
+    holds a different, older copy, so the worktree's takes its place and the older is archived; aside: the primary
+    holds a different copy at least as new, so it stays and the worktree's is archived; dropped: regenerable; work:
+    too much to compare (a person decides). Newer means a later modification time by more than KEEP_ASIDE_SLACK_S.
+    Until kit 31 every different copy was work, and the copy kept in place was whichever was in the primary, so a
+    newer build could end up archived while an older one stayed live (Subaru, 2026-10-23: 153 files)."""
+    res = {"carry": [], "dup": [], "replace": [], "aside": [], "dropped": 0, "work": []}
     budget = 0
     for rel in ignored(wt):
         if dropping(rel):
@@ -496,8 +510,108 @@ def ignored_plan(primary, wt):
             if budget > LARGE_IGNORED_BYTES:
                 res["work"].append(f"{f} (more than {LARGE_IGNORED_BYTES >> 30} GB of ignored files to compare)")
                 return res
-            (res["dup"] if same_file(mine, theirs) else res["work"]).append(f)
+            if same_file(mine, theirs):
+                res["dup"].append(f)
+            elif newer(mine, theirs):
+                res["replace"].append(f)
+            else:
+                res["aside"].append(f)
     return res
+
+
+def newer(a, b):
+    """True when `a` was modified more than KEEP_ASIDE_SLACK_S after `b`."""
+    try:
+        return os.lstat(a).st_mtime > os.lstat(b).st_mtime + KEEP_ASIDE_SLACK_S
+    except OSError:
+        return False
+
+
+ASIDE_GLOB = "/.agents/residue/*/ignored-copies-*.tar.gz"
+
+
+def aside_archive(primary, label, date):
+    """Repo-relative path of the archive keep_aside() writes: one per worktree and day, never over an existing one."""
+    base = f"{RESIDUE}/{label}"
+    rel, n = f"{base}/ignored-copies-{date}.tar.gz", 2
+    while (Path(primary) / rel).exists():
+        rel, n = f"{base}/ignored-copies-{date}-{n}.tar.gz", n + 1
+    return rel
+
+
+def exclude_aside(primary, rel):
+    """Keep the archive out of git in this clone (info/exclude in the common git dir), and prove it."""
+    rc, common, _ = git(primary, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if rc:
+        raise RuntimeError("could not find the primary's git dir to exclude the kept-aside archive")
+    ex = Path(common) / "info" / "exclude"
+    ex.parent.mkdir(parents=True, exist_ok=True)
+    have = ex.read_text().splitlines() if ex.exists() else []
+    if ASIDE_GLOB not in have:
+        with open(ex, "a") as f:
+            f.write(("\n" if have and not ex.read_text().endswith("\n") else "")
+                    + "# session kit 31: copies of ignored files kept aside at retirement (local only)\n"
+                    + ASIDE_GLOB + "\n")
+    if git(primary, "check-ignore", "-q", "--no-index", rel)[0] != 0:
+        raise RuntimeError(f"{rel} would not be ignored by git; nothing was changed")
+
+
+def _digest(path):
+    if os.path.islink(path):
+        return "link:" + os.readlink(path)
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def keep_aside(primary, wt, replace, aside, rel):
+    """Of two different copies of an ignored file, the newer stays in place and the older is kept (kit 31; Brien,
+    2026-10-23: "change the retire rule so the newer copy wins in place"). Every copy that loses its place is written
+    to the archive `rel` in the primary and read back byte for byte BEFORE anything in the primary changes:
+    replace: the primary's older copy goes in as replaced-in-primary/<path>, then the worktree's newer copy is moved
+    into the primary (its modification time kept); aside: the worktree's older copy goes in as from-worktree/<path>
+    and leaves with the worktree. Returns how many files took a new place. Raises RuntimeError when a copy cannot be
+    confirmed or the primary's copy changed in the meantime; the primary is then as it was."""
+    if not replace and not aside:
+        return 0
+    primary, wt = Path(primary), Path(wt)
+    exclude_aside(primary, rel)
+    members = ([(primary / r, f"replaced-in-primary/{r}") for r in replace]
+               + [(wt / r, f"from-worktree/{r}") for r in aside])
+    want = {name: _digest(src) for src, name in members}
+    dest = primary / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_name(dest.name + ".part")
+    with tarfile.open(part, "w:gz", format=tarfile.PAX_FORMAT) as t:
+        for src, name in members:
+            t.add(str(src), arcname=name, recursive=False)
+    with tarfile.open(part) as t:
+        for m in t.getmembers():
+            got = ("link:" + m.linkname) if m.issym() else hashlib.sha256(t.extractfile(m).read()).hexdigest()
+            if want.get(m.name) != got:
+                part.unlink()
+                raise RuntimeError(f"{m.name}: its copy in the archive does not match; nothing was changed")
+        if len(t.getmembers()) != len(members):
+            part.unlink()
+            raise RuntimeError("the archive is missing copies; nothing was changed")
+    os.replace(part, dest)
+    placed = 0
+    for r in replace:
+        src, to = wt / r, primary / r
+        if _digest(to) != want[f"replaced-in-primary/{r}"]:
+            raise RuntimeError(f"{r}: the primary's copy changed after it was archived; both kept, worktree left")
+        mine = _digest(src)
+        try:
+            os.replace(src, to)
+        except OSError:
+            shutil.copy2(src, to, follow_symlinks=False)
+            os.unlink(src)
+        if _digest(to) != mine:
+            raise RuntimeError(f"{r}: the newer copy did not arrive intact; the older is in {rel}")
+        placed += 1
+    return placed
 
 
 def carry_ignored(primary, wt, rels):
@@ -702,13 +816,16 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
         return rec
     plan = ignored_plan(primary, wt)
     if plan["work"]:
-        rec["reason"] = ("ignored files the primary already holds a different copy of (a person decides which to "
+        rec["reason"] = ("too many ignored bytes to compare against the primary (a person decides which copies to "
                          "keep): " + ", ".join(plan["work"][:8]))
         return rec
     rec["snapshot"] = sorted({p for _, p in entries})
     if dry_run:
         rec["action"] = "would-retire"
         rec["reason"] = (reason or "retired") + f"; {len(rec['snapshot'])} uncommitted path(s) to snapshot"
+        if plan["replace"] or plan["aside"]:
+            rec["reason"] += (f"; {len(plan['replace'])} newer ignored copy(ies) would take the primary's place and "
+                              f"{len(plan['aside'])} older one(s) would be set aside, both sides archived")
         return rec
     os.environ["SESSION_WIP_BACKUP"] = "0"  # this process's own commits push no backup ref
     when = datetime.fromtimestamp(now) if now else datetime.now()
@@ -729,9 +846,12 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
         rec.update(tag=tag, archived=archived, snapshot_commit=snap or "")
         residue = empty_residue()
         residue["snapshot"], residue["carry"], residue["dup"] = rec["snapshot"], plan["carry"], plan["dup"]
+        residue["replace"], residue["aside"] = plan["replace"], plan["aside"]
+        aside_rel = aside_archive(primary, wt.name, date) if plan["replace"] or plan["aside"] else None
         w = {"path": wt, "branch": branch, "head": head}
         c = {"wt": w, "kind": kind, "how": how or "not on main", "idle_h": idle_h, "residue": residue, "tag": tag,
              "info": commit_info(wt, base), "why_retired": reason or "retired by hand", "archived": archived,
+             "aside_archive": aside_rel,
              "why": f"Retired, work not on main: {reason or 'retired by hand'}"
                     + (f"; {len(rec['snapshot'])} uncommitted path(s) in its snapshot" if rec["snapshot"] else "")}
         stamp = when.strftime("%H%M")
@@ -751,6 +871,8 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
             route, ref = land_record(primary, base, build_record(primary, base, [c], date, stamp, source=source,
                                                                  intro=RETIRE_INTRO), message)
         rec.update(route=route, record=ref)
+        rec["newer_placed"] = keep_aside(primary, wt, plan["replace"], plan["aside"], aside_rel) if aside_rel else 0
+        rec["kept_aside"] = aside_rel or ""
         rec["moved_files"] = carry_ignored(primary, wt, plan["carry"])
         rec["freed_mb"] = remove_worktree(primary, wt, branch, tag)
         rec["wip_dropped"] = False if archived else drop_wip(primary, branch)
