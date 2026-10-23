@@ -536,6 +536,25 @@ def unlink_pruning(wt, rel):
         d = d.parent
 
 
+def empty_dir(p):
+    """True for a real folder (not a link) with no file or link anywhere under it."""
+    if p.is_symlink() or not p.is_dir():
+        return False
+    for dp, dirs, files in os.walk(p):
+        if files or any(os.path.islink(os.path.join(dp, d)) for d in dirs):
+            return False
+    return True
+
+
+def prune_empty(p):
+    """Remove an empty folder tree, deepest first."""
+    for d, _, _ in sorted(os.walk(p), key=lambda t: len(t[0]), reverse=True):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+
+
 def du_mb(path):
     try:
         r = subprocess.run(["du", "-sk", str(path)], capture_output=True, text=True, timeout=600)
@@ -552,6 +571,14 @@ def remove_worktree(primary, wt, branch, tag):
     rc, plain, _ = git(wt, "status", "--porcelain", "--ignore-submodules=none")
     if not left and plain:
         left = [(l[:2], l[3:]) for l in plain.splitlines()]
+        # A folder that holds no file is nothing to keep: the untracked cache can list one for weeks after its
+        # last file went (two landed worktrees errored every hour for a week, 2026-10-16 to 10-23). Remove it.
+        if all(xy == "??" and empty_dir(Path(wt) / p) for xy, p in left):
+            for _, p in left:
+                prune_empty(Path(wt) / p)
+            git(wt, "update-index", "--untracked-cache")
+            _, plain, _ = git(wt, "-c", "core.untrackedCache=false", "status", "--porcelain", "--ignore-submodules=none")
+            left = [(l[:2], l[3:]) for l in plain.splitlines()]
     if left:
         raise RuntimeError(f"{len(left)} path(s) still uncommitted after keeping the residue: "
                            + ", ".join(p for _, p in left[:5]))

@@ -371,6 +371,9 @@ so only in a log nobody reads. Four changes:
   `session retire` for leftover files on landed work). A Claude Code SessionStart hook prints a block of
   at most 12 lines from it, headed `STUCK WORKTREES (N)`, at the start of every session.
 
+Kit 30: a worktree the reaper fails on for over 48 hours is listed too, and an empty folder that git's
+untracked cache still lists no longer blocks a retirement.
+
 The reaper also counts more landings as landed: every commit patch-equivalent to one on main
 (`git cherry`), or the branch's whole change equal by patch id to one commit on main (a squash pull
 request that later commits changed again).
