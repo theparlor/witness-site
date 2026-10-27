@@ -9,7 +9,10 @@ a new one is the point, editing an existing one is never done. Three changes are
 (kit v16, 2026-09-28, purpose-oriented engagement folders): a byte-identical move that stays inside
 the same root (a rename with 100% similarity), a deletion whose bytes remain at another path under
 the same root (dropping an exact duplicate), and an edit to an index file (a basename listed in
-read_only_root_index_files, CONTEXT.md by default) at any depth under the root.
+read_only_root_index_files, CONTEXT.md by default) at any depth under the root. Kit 32 (WS-DDR-163 item 9,
+2026-10-26) adds a fourth: a byte-identical rename out of the root that an applied reorganization record in the
+same change names exactly (.intent/reorganizations/*/hashes*.json: the old and new path in `pairs`, the file's
+sha256 in `before`), for a file filed there by mistake. An unrecorded move out still fails.
 
 Only the change's own task record (the one naming the branch) counts as the change's own in the overlap check; a
 record the change closes is not (kit 26). A task record with a live status whose worktree and branch are both gone is a stale lock (kit 24): it is
@@ -21,7 +24,7 @@ glob must keep a unique key, must not carry its header again as a data row, and 
 second key. A land whose rebase conflict covered a whole appended register pushed exactly that shape on 2026-09-26
 (header swallowed as a data row, 31 rows renumbered and kept twice) while this audit reported no findings.
 """
-import argparse, csv, fnmatch, json, os, subprocess, sys
+import argparse, csv, fnmatch, hashlib, json, os, subprocess, sys
 from pathlib import Path
 
 def git(root, *args, check=True):
@@ -69,6 +72,29 @@ def stale(t):
         if any(c.exists() for c in ([p] if p.is_absolute() else [ROOT / p, common / p, common.parent / p.name])): return False
     if branch and branch_exists(branch): return False
     return True
+
+def recorded_moves():
+    """(old, new, sha256 before) of every move an applied reorganization record lists (kit 32, WS-DDR-163 item 9): the
+    `pairs` and `before` of .intent/reorganizations/*/hashes*.json, the record purpose-restructure.py apply writes."""
+    out = set()
+    for f in sorted((ROOT / ".intent" / "reorganizations").glob("*/hashes*.json")):
+        try:
+            rec = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        before = rec.get("before") or {}
+        for pair in rec.get("pairs") or []:
+            if isinstance(pair, (list, tuple)) and len(pair) == 2 and pair[0] in before:
+                out.add((pair[0], pair[1], before[pair[0]]))
+    return out
+
+def file_sha256(path):
+    try:
+        return hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
+    except OSError:
+        return ""
 
 def head_blobs(root):
     """Blob ids of every tracked path under a read-only root at HEAD."""
@@ -157,6 +183,7 @@ def main():
             # root and a deletion whose bytes remain elsewhere under the root are not edits either.
             index_files = {root + "/" + n for n in index_names}
             blobs = None
+            recorded = None
             hits = []
             for x in sorted(altered):
                 if not under(x, root): continue
@@ -164,6 +191,11 @@ def main():
                 if x in moved:
                     new, sim = moved[x]
                     if sim == 100 and under(new, root): continue
+                    # kit 32: an original leaves the root only in a recorded reorganization: the change carries an
+                    # applied record naming this exact move, and the bytes that arrive hash to the recorded value
+                    if sim == 100:
+                        if recorded is None: recorded = recorded_moves()
+                        if any(o == x and n == new and h == file_sha256(new) for o, n, h in recorded): continue
                 if x in deleted and a.against:
                     if blobs is None: blobs = head_blobs(root)
                     blob = git(ROOT, "rev-parse", "--verify", "--quiet", f"{a.against}:{x}", check=False).strip()
