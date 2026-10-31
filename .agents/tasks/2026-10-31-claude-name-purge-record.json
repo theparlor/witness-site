@@ -1,0 +1,16 @@
+{
+  "id": "2026-10-31-claude-name-purge-record",
+  "provider": "claude",
+  "status": "complete",
+  "branch": "agent/claude/2026-10-31-name-purge-record",
+  "worktree": "../witness-site-wt-2026-10-31-name-purge-record",
+  "base_commit": "43b9eb7",
+  "objective": "record the 2026-10-31 name purge of this public repo's history: manifest, ledger row, KF-11 review in the handoff",
+  "owned_paths": [
+    ".intent/retirements",
+    ".agents/handoffs"
+  ],
+  "started": "2026-10-31T04:59:12-04:00",
+  "handoff": ".agents/handoffs/2026-10-31-claude-name-purge-record.md",
+  "landed": "2026-10-31T04:59:13-04:00"
+}
