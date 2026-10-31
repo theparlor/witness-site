@@ -384,6 +384,33 @@ The reaper also counts more landings as landed: every commit patch-equivalent to
 (`git cherry`), or the branch's whole change equal by patch id to one commit on main (a squash pull
 request that later commits changed again).
 
+### A land with decisions in its handoff leaves a signal beside it (kit 33)
+
+On 2026-10-31 a sweep listed five products as busy with commits and silent on signals. Reading their records
+showed one cause: the session routine writes a handoff and a task file and never a signal. Sessions filled the
+handoff's "Decisions made" field about a quarter of the time, and even then the decision stayed in a file the
+sweeps never read; one 45-file land that day had a handoff with every field blank. A decision reached the record
+only when someone chose to write a signal.
+
+Now `land` puts the path at the source. After the rebase and before the checks, it reads this session's handoff.
+When "Decisions made" or "Unresolved risks or decisions" is filled (not blank, not `none`, `n/a`, `tbd` or the
+like) and the change itself adds or changes no `.intent/signals/*.md`, it writes
+`.intent/signals/SIG-<repo>-<task>-<date>.md`: frontmatter (`id`, `title`, `type: signal`, `status: open`,
+`severity: low`, `created`, `source_handoff`, `derived_by: session land`, the branch and the commit range), then
+the two fields' lines copied verbatim and the commit range. It creates `.intent/signals/` and a short
+`CONTEXT.md` (when to add a signal, the naming, the closure token) when they are absent, and lands them with the
+work: folded into the last commit when that commit has not been pushed, else as `session: signal stub ...`. The kit
+writes nothing of its own beyond that frame.
+
+Skipped, and the reason reported to Witness (`signal_stub`): a robot session (`start --robot`, or a task name
+under the policy's `robot_tasks`); a handoff that is missing or whose two fields are empty; a change that already
+carries a signal; the same words already in a stub this kit wrote for the task (a second land of one session adds
+a stub only when the fields changed; it is then `...-<date>-2.md`). There is never a prompt: sessions are often
+unattended. The stub is written before the KF-11 count, so it is counted and the gates judge it. It is fail-open:
+an error leaves the index as it was, prints one note, reports `signal_stub: error` with the exception's name, and
+the land goes on. Treat a stub like any signal: triage it, raise its severity, or resolve it with
+`upstream_control_path` and `catch_mechanism`.
+
 ## What the hooks enforce
 
 A Claude Code hook blocks Write and Edit into the primary checkout of any repo that carries
