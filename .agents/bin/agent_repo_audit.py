@@ -230,7 +230,7 @@ def main():
         # Only an overlap involving this change's own task blocks; older overlaps are reported, not fatal.
         # This change's own record: the one naming the branch checked out here (kit 26). Until then every record the
         # change touched counted as its own, so a session closing another record (status complete in this change)
-        # overlapped the record it was closing whenever that record claimed `.agents` (Turnberry, 2026-10-07). With
+        # overlapped the record it was closing whenever that record claimed `.agents` (an engagement repo, 2026-10-07). With
         # no record naming the branch, the touched records still live in this tree, never one being closed.
         touched = {}
         for x in changed:

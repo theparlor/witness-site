@@ -488,7 +488,7 @@ def ignored_plan(primary, wt):
     holds a different copy at least as new, so it stays and the worktree's is archived; dropped: regenerable; work:
     too much to compare (a person decides). Newer means a later modification time by more than KEEP_ASIDE_SLACK_S.
     Until kit 31 every different copy was work, and the copy kept in place was whichever was in the primary, so a
-    newer build could end up archived while an older one stayed live (Subaru, 2026-10-23: 153 files)."""
+    newer build could end up archived while an older one stayed live (an engagement repo, 2026-10-23: 153 files)."""
     res = {"carry": [], "dup": [], "replace": [], "aside": [], "dropped": 0, "work": []}
     budget = 0
     for rel in ignored(wt):
