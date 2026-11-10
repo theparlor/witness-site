@@ -48,6 +48,13 @@ risks or decisions" field is filled and the change touches no signal file, `land
 SIG-<repo>-<task>-<date>.md (the fields' lines verbatim, the commit range, `derived_by: session land`), creates the
 folder and its CONTEXT.md when absent, and lands it with the work. Robot sessions, empty or "none" fields and a
 change that already carries a signal are skipped; a failure to write it never blocks the land (reported to Witness).
+Kit 35 closes three work-loss paths found by the 2026-11-10 check of the kit's implicit states. `finish` keeps ignored
+files the way `retire` does before `git worktree remove`, which deleted them without asking and exited 0 (moved to the
+primary, the newer copy winning, the older archived; regenerable ones go with the worktree; one it cannot keep stops the
+finish with nothing removed). `wip-backup` leaves its result in the worktree's git dir, and `status` shows each
+session's backup (current, behind, failing or none, with its age) and says when backups are off in the shell. `status`
+names a land stopped at a rebase conflict by its branch; the hourly reaper reports it as stuck and backs it up under the
+branch's own name too.
 """
 import argparse, contextlib, datetime as dt, filecmp, fnmatch, importlib.util, io, json, os, re, shutil, signal, subprocess, sys, time
 from pathlib import Path
@@ -996,6 +1003,50 @@ def overlaps(ss):
     return found
 
 
+def span(h):
+    """Hours as a person reads them: minutes under an hour, days past two."""
+    return f"{round(h * 60)} min" if h < 1 else f"{h:.1f} h" if h < 48 else f"{h / 24:.1f} d"
+
+
+def backup_line(b):
+    """One line on a session's backup for `status` (kit 35), from retirement.backup_summary."""
+    age = f"newest good copy {span(b['age_h'])} old" if b.get("age_h") is not None else "no good copy recorded"
+    who = {"commit": "the commit hook", "reaper": "the hourly reaper"}.get(b.get("writer"), "")
+    if b["state"] == "current":
+        local = ("; its uncommitted files stay on this machine (a public repository gets the committed tip only)"
+                 if "uncommitted kept local" in (b.get("detail") or "") else "")
+        return f"backup: current on origin ({b.get('ref') or 'refs/wip'}), {age}" + (f", by {who}" if who else "") + local
+    if b["state"] == "failing":
+        since = f" for {span(b['failing_h'])}" if b.get("failing_h") is not None else ""
+        why = f" ({b['result']}: {b['detail'][:120]})" if b.get("detail") else f" ({b['result']})"
+        return f"backup: FAILING{since}{why}; this work is on this machine only; {age}"
+    if b["state"] == "behind":
+        return (f"backup: BEHIND: HEAD has commits no backup holds; {age}. A commit made with SESSION_WIP_BACKUP=0, by "
+                "a land's own step, or on a branch outside agent/ and claude/ pushes none; the hourly reaper catches up")
+    return "backup: none recorded on this machine yet"
+
+
+def backup_readings(ss):
+    """Add each session's backup reading and stopped land to the status records (kit 35). Fail-open: a kit without
+    retirement.py, or a reading that raises, leaves the session as it was and says nothing."""
+    try:
+        rt = load_retirement()
+    except (Exception, SystemExit):
+        return
+    for s in ss:
+        try:
+            p = Path(s["path"])
+            gd = git(p, "rev-parse", "--path-format=absolute", "--git-dir", check=False, env=READ_ONLY)
+            head = git(p, "rev-parse", "-q", "--verify", "HEAD", check=False, env=READ_ONLY)
+            s["backup"] = rt.backup_summary(gd, head)
+            s["stopped_land"] = rt.stopped_rebase_branch(gd) if gd else ""
+        except Exception:
+            continue
+    for k in ("current", "behind", "failing", "none"):
+        EVENT["attrs"][f"backup_{k}"] = sum(1 for s in ss if (s.get("backup") or {}).get("state") == k)
+    EVENT["attrs"]["stopped_lands"] = sum(1 for s in ss if s.get("stopped_land"))
+
+
 def cmd_status(a):
     _, primary, _ = here(a.here)
     base = default_branch(primary)
@@ -1003,14 +1054,21 @@ def cmd_status(a):
     ss = sessions(primary)
     ov = overlaps(ss)
     EVENT["attrs"].update(sessions=len(ss), overlaps=len(ov))
+    backup_readings(ss)
+    off = os.environ.get(WIP_SWITCH, "").strip() == "0"
+    EVENT["attrs"]["backup_off"] = off
     pbranch = git(primary, "branch", "--show-current", check=False) or "(detached)"
     pdirty = len(git(primary, "status", "--porcelain", check=False, env=READ_ONLY).splitlines())
     pstaged = name_list(primary, "--cached", check=False, env=READ_ONLY)  # a stale index, named (kit 28)
     pbehind = primary_behind(primary, base)
     if a.json:
         print(json.dumps({"primary": str(primary), "primary_branch": pbranch, "primary_dirty": pdirty,
-                          "primary_staged": pstaged, "primary_behind": pbehind, "sessions": ss, "overlaps": ov}, indent=2))
+                          "primary_staged": pstaged, "primary_behind": pbehind, "backup_off_in_shell": off,
+                          "sessions": ss, "overlaps": ov}, indent=2))
         return 1 if ov else 0
+    if off:
+        print(f"backups: OFF in this shell ({WIP_SWITCH}=0 is set): commits made from it push no backup to origin. "
+              "Unset it unless a kit step set it for itself")
     print(f"primary: {primary}  on {pbranch}, {pdirty} uncommitted path(s)" +
           ("" if pbranch == base else f"  WARNING: primary should be on {base}"))
     if pstaged:
@@ -1023,9 +1081,14 @@ def cmd_status(a):
         print("no live sessions")
     for s in ss:
         print(f"\n- {s['branch']}  ({s['task'] or 'no task file'})\n  {s['path']}")
+        if s.get("stopped_land"):
+            print(f"  LAND STOPPED at a rebase conflict on {s['stopped_land']}: resolve by meaning, `git add` the files, "
+                  "`git rebase --continue`, then `session land` again")
         if s["objective"]:
             print(f"  objective: {s['objective']}")
         print(f"  {len(s['changed'])} changed file(s), {s['uncommitted']} uncommitted; {s['ahead']} ahead, {s['behind']} behind {base}")
+        if s.get("backup"):
+            print(f"  {backup_line(s['backup'])}")
     for o in ov:
         print(f"\nOVERLAP {o['left']} and {o['right']}: files {o['files'][:10]} owned {o['owned'][:5]}")
     return 1 if ov else 0
@@ -1774,6 +1837,46 @@ def pick_worktree(primary, linked, top, task, verb):
     return Path(cands[0]["path"])
 
 
+def keep_ignored(primary, wt):
+    """Keep every ignored file before finish removes the worktree, with retire's own helpers (kit 35).
+
+    `git worktree remove`, even without --force, deletes ignored files and exits 0: a local credentials file, a client
+    original kept out of git for its size, a pulled dataset. `retire` and the reaper move them first; through kit 34
+    `finish` did not (U8 in Core/products/_intake/2026-11-09-resilient-ways-of-working/31-session-kit-implicit-states.md,
+    checked in a throwaway repository). Now, as in retire (retirement.ignored_plan, keep_aside, carry_ignored): a file
+    the primary lacks is moved there; an identical copy is left to go; where the primary holds a different copy, the
+    newer takes the primary's path and the older is kept in .agents/residue/<worktree>/ignored-copies-<date>.tar.gz
+    (ignored through this clone's info/exclude); regenerable files (.venv, node_modules, caches) go with the worktree.
+    More ignored bytes to compare than retirement.LARGE_IGNORED_BYTES, or a copy that cannot be confirmed, stops the
+    finish with exit status 1 and nothing removed. The Witness event carries the counts, never a path."""
+    rt = load_retirement()
+    plan = rt.ignored_plan(primary, wt)
+    counts = {"ignored_moved": 0, "ignored_replaced": 0, "ignored_aside": len(plan["aside"]),
+              "ignored_same": len(plan["dup"]), "ignored_dropped": plan["dropped"]}
+    EVENT["attrs"].update(counts)
+    stop = (f"Nothing was removed: {wt} and its branch are as they were apart from files already moved to the primary. "
+            "Move or delete the named files yourself, then run `session finish` again")
+    if plan["work"]:
+        EVENT["attrs"]["reason"] = "finish_ignored_refused"
+        sys.exit(f"session: finish stopped before removing the worktree, because `git worktree remove` would delete "
+                 f"ignored files the kit could not compare: {names(plan['work'])}.\n{stop}")
+    aside = rt.aside_archive(primary, wt.name, dt.date.today().isoformat()) if plan["replace"] or plan["aside"] else None
+    try:
+        if aside:
+            counts["ignored_replaced"] = rt.keep_aside(primary, wt, plan["replace"], plan["aside"], aside)
+        counts["ignored_moved"] = rt.carry_ignored(primary, wt, plan["carry"])
+    except (RuntimeError, OSError) as e:
+        EVENT["attrs"].update(counts, reason="finish_ignored_refused")
+        sys.exit(f"session: finish stopped before removing the worktree: an ignored file could not be kept ({e}).\n{stop}")
+    EVENT["attrs"].update(counts)
+    kept = counts["ignored_moved"] + counts["ignored_replaced"]
+    if kept or aside:
+        print(f"kept {kept} ignored file(s) in the primary checkout before removing the worktree"
+              + (f"; {counts['ignored_replaced']} newer copy(ies) took the primary's place, and the copies they replaced "
+                 f"plus {counts['ignored_aside']} older worktree copy(ies) are archived in {aside}" if aside else ""))
+    return counts
+
+
 def cmd_finish(a):
     top, primary, linked = here(a.here)
     os.environ[WIP_SWITCH] = "0"
@@ -1803,6 +1906,7 @@ def cmd_finish(a):
     if "/.claude/worktrees/" in str(wt):
         print(f"left {wt} in place: the desktop app owns that worktree")
         return 0
+    keep_ignored(primary, wt)  # `git worktree remove` deletes ignored files without asking (kit 35)
     os.chdir(primary)  # never remove the directory we are standing in
     git(primary, "worktree", "remove", str(wt))
     run(["git", "branch", "-D", branch], primary, check=False)
@@ -1867,6 +1971,7 @@ def cmd_wip_backup(a):
         EVENT["attrs"]["decision"] = "not_a_session_branch"
         return 0
     lock = Path(git(top, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)) / "wip-backup.lock"
+    gitdir = git(top, "rev-parse", "--path-format=absolute", "--git-dir", check=False, env=READ_ONLY)
     import fcntl
     with open(lock, "a") as fh:
         deadline = time.monotonic() + WIP_TIMEOUT
@@ -1877,11 +1982,15 @@ def cmd_wip_backup(a):
             except OSError:
                 if time.monotonic() > deadline:
                     EVENT["attrs"]["decision"] = "lock_timeout"
+                    record_backup(gitdir, "lock_timeout", git(top, "rev-parse", "-q", "--verify", f"refs/heads/{branch}",
+                                                             check=False, env=READ_ONLY), branch,
+                                  "another backup push held this clone's lock past the timeout")
                     return 0
                 time.sleep(0.2)
+        tip = git(top, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False, env=READ_ONLY)
         try:
-            r = subprocess.run(["git", "push", "-q", "origin", f"+refs/heads/{branch}:{wip_ref(branch)}"], cwd=top,
-                               capture_output=True, text=True, timeout=WIP_TIMEOUT, env=wip_env())
+            r = subprocess.run(["git", "push", "-q", "origin", f"+{tip or 'refs/heads/' + branch}:{wip_ref(branch)}"],
+                               cwd=top, capture_output=True, text=True, timeout=WIP_TIMEOUT, env=wip_env())
             err, rc = (r.stderr or r.stdout).strip(), r.returncode
         except subprocess.TimeoutExpired:
             err, rc = "timed out", 124
@@ -1896,17 +2005,44 @@ def cmd_wip_backup(a):
                                       else "archived" if re.search(r"archived|read-only", err, re.I) else "push_failed")
         if not a.quiet:
             print(f"session: backup push of {branch} failed: {' '.join(err.split())[:200]}", file=sys.stderr)
+    record_backup(gitdir, EVENT["attrs"]["decision"], tip, branch, "" if rc == 0 else err)
     return 0
 
 
+def record_backup(gitdir, result, tip, branch, detail=""):
+    """Leave this push's result in the worktree's git dir (session-backup.json, kit 35), so `session status` and the
+    reaper's stuck file can say what is not on GitHub and for how long. Fail-open: a record it cannot write changes
+    nothing about the backup, and the Witness event says whether it was written."""
+    try:
+        rec = load_retirement().write_backup_record(gitdir, "commit", result, head=tip, target=tip,
+                                                    ref=wip_ref(branch), detail=detail) if gitdir else None
+    except (Exception, SystemExit):
+        rec = None
+    EVENT["attrs"]["recorded"] = rec is not None
+
+
+_RETIREMENT = []
+
+
 def load_retirement():
-    """retirement.py beside this script (kit 29): the routine and record format shared with the worktree reaper."""
+    """retirement.py beside this script (kit 29): the routine and record format shared with the worktree reaper.
+
+    Loaded once per run and with no bytecode written (kit 35): since `status`, `finish` and the commit hook's backup
+    load it too, a __pycache__ folder written beside it would sit untracked in every session worktree of a repository
+    that does not ignore it, where `finish` reads it as uncommitted work and `status` as a changed file."""
+    if _RETIREMENT:
+        return _RETIREMENT[0]
     src = Path(__file__).resolve().parent / "retirement.py"
     if not src.is_file():
         sys.exit(f"session: {src} is missing; reinstall the session kit (kit 29 or later)")
     spec = importlib.util.spec_from_file_location("session_kit_retirement", src)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    was, sys.dont_write_bytecode = sys.dont_write_bytecode, True
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.dont_write_bytecode = was
+    _RETIREMENT.append(mod)
     return mod
 
 

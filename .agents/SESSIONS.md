@@ -76,7 +76,9 @@ python3 .agents/bin/session status
 Lists every live session on this repo: its branch, what it has changed, how far behind main
 it is, and any file two sessions both touch. It also prints how far behind `origin/main` the
 primary checkout is (`primary: N behind`), so a landed change that has not reached the shared
-checkout is visible before anyone opens a stale file from it.
+checkout is visible before anyone opens a stale file from it. Since kit 35 it also gives each
+session's backup on origin (current, behind, failing or none, with its age), names a land stopped
+at a rebase conflict by its branch, and says first when backups are off in the shell.
 
 ```bash
 python3 .agents/bin/session land
@@ -119,7 +121,8 @@ python3 .agents/bin/session finish
 ```
 
 After the merge: fast-forwards the primary checkout, removes your worktree (only if it is
-clean) and deletes the local branch.
+clean) and deletes the local branch. Before the removal it keeps every ignored file the way
+`retire` does (kit 35, below), and stops with nothing removed when one cannot be kept.
 
 ```bash
 python3 .agents/bin/session retire --reason "<why, in a few words>"
@@ -369,7 +372,8 @@ so only in a log nobody reads. Four changes:
   `refs/wip/<branch>`. That is a backup, not a landing: GitHub lists a ref outside `refs/heads` as no
   branch and runs no workflow for it (probed 2026-10-23 on a repo whose workflow runs on every push), and
   the pre-push check skips backup refs and archive tags. A commit never waits for it and never fails for
-  it; offline the push simply fails, quietly. It needs only `git push` (no `gh`).
+  it; offline the push simply fails, quietly, and since kit 35 its result is recorded where `session
+  status` shows it. It needs only `git push` (no `gh`).
   `SESSION_WIP_BACKUP=0` turns it off for one command. `land`, `finish` and `retire` delete the ref.
 - **`session retire`** (the command above) is the manual path for work that will not land. It refuses,
   changing nothing, while a rebase or merge is in progress, while a stopped land keeps copies aside, when
@@ -439,6 +443,51 @@ unattended. The stub is written before the KF-11 count, so it is counted and the
 an error leaves the index as it was, prints one note, reports `signal_stub: error` with the exception's name, and
 the land goes on. Treat a stub like any signal: triage it, raise its severity, or resolve it with
 `upstream_control_path` and `catch_mechanism`.
+
+### Three ways work could be lost in silence, closed (kit 35)
+
+On 2026-11-10 a check of the kit's implicit states
+(`Core/products/_intake/2026-11-09-resilient-ways-of-working/31-session-kit-implicit-states.md`, under the Workspaces
+root) found three ways work could be lost without a word, and confirmed each in a throwaway repository. Each fix adds a
+preserving step or a report; none removes access, and every refusal says what to do.
+
+- **`finish` keeps ignored files.** `git worktree remove`, even without `--force`, deletes gitignored files and exits 0:
+  a local credentials file, a client original kept out of git for its size, a pulled dataset. `retire` and the reaper
+  moved them first; `finish` did not. Now `finish` keeps them the same way, with the same code (`retirement.py`): a file
+  the primary lacks is moved there, an identical one is left to go, and where the primary holds a different copy the
+  newer takes the primary's path and the older goes into `.agents/residue/<worktree>/ignored-copies-<date>.tar.gz`
+  (ignored through this clone's `info/exclude`). Regenerable files (`.venv`, `node_modules`, caches) go with the
+  worktree. More than 2 GB of ignored files to compare, or a copy that cannot be confirmed, stops the finish with exit
+  status 1 and nothing removed, naming the files. A desktop-app worktree is still left in place for the app; the reaper
+  keeps its ignored files when it retires it.
+- **A backup that fails says so.** The backup push after each commit now records its result in the worktree's git dir
+  (`session-backup.json`), and the hourly reaper records its own beside it (`worktree-reaper-backup.json`). `session
+  status` reads both and gives each session one line: `current` (origin holds this HEAD), `BEHIND` (HEAD has commits no
+  backup holds: made with `SESSION_WIP_BACKUP=0`, by a land's own steps, or on a branch outside `agent/` and `claude/`;
+  the hourly reaper catches up), `FAILING` and for how long (the work is on this machine only), or none recorded, each
+  with the age of the newest good copy; `--json` carries the same under `backup`. When `SESSION_WIP_BACKUP=0` is set in
+  the shell, `status` says so on its first line. The reaper's stuck file gains `backup_failing`, every worktree whose
+  backup push failed in that run, at any age, and `fetch_failed`, every repository whose fetch failed, with how many
+  worktrees it left unjudged and the error. Until now a failed fetch dropped that repository's worktrees from the stuck
+  file and from the backup, so a failing credential hid all of them; they are backed up regardless now. The SessionStart
+  block prints both as short blocks (`BACKUP FAILING`, `REPOS NOT CHECKED`) beside the stuck list, and each stuck row
+  says how old its backup is.
+- **A stopped land is reported, and backed up under its branch.** A land that stops at a rebase conflict leaves the
+  worktree detached until the rebase finishes. The reaper listed it nowhere and backed it up only as
+  `refs/wip/detached/<folder>`, a name no command deletes and no resume looks for. Now `status` names it (`LAND STOPPED
+  at a rebase conflict on <branch>`; `stopped_land` in `--json`), the reaper lists it as stuck past the 48-hour line
+  with the commands that finish it, and it is also pushed as `refs/wip/<branch>`: a commit whose first parent is the
+  rebase so far (its tree holds every uncommitted file, conflict resolutions included, on a private repository) and
+  whose other parents are the branch's own tip and whatever that ref held before, so nothing the ref held is dropped.
+  The detached copy is still pushed. A worktree held by a `git worktree lock` and idle for a week is listed as well,
+  with the lock's reason, and never removed.
+
+The Witness events carry the new counts, never a path: `ignored_moved`, `ignored_replaced`, `ignored_aside`,
+`ignored_same` and `ignored_dropped` on `finish` (reason `finish_ignored_refused` when it stops); `recorded` on
+`wip-backup`; `backup_current`, `backup_behind`, `backup_failing`, `backup_none`, `backup_off` and `stopped_lands` on
+`status`; and on the reaper's run event `backup_failing`, `fetch_failed`, `stuck_stopped_lands` and
+`stopped_land_backup_error`, with one `org_design_tooling.worktree_backup` event per push, a stopped land's second push
+marked `stopped_land`.
 
 ## What the hooks enforce
 

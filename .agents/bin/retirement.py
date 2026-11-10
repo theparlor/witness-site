@@ -33,6 +33,10 @@ retire() in order, refusing before it changes anything:
 An origin GitHub has archived (read-only) refuses the tag push: the tag stays local, and the ledger row and manifest
 land in the Workspaces root's .intent/retirements/ instead (the first ancestor of the repository that is a git
 checkout, or $WORKSPACES_ROOT), so a retirement there neither fails nor repeats.
+
+Kit 35: `session finish` keeps ignored files with the same three helpers (ignored_plan, keep_aside, carry_ignored)
+before its own `git worktree remove`, and the backup records (write_backup_record, backup_summary) live here so the
+commit hook's push, the reaper and `session status` read one format.
 """
 import filecmp
 import hashlib
@@ -42,6 +46,7 @@ import re
 import shutil
 import subprocess
 import tarfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -221,6 +226,110 @@ def wip_heads(cwd, timeout=60):
         if ref.startswith(WIP_NS):
             heads[ref[len(WIP_NS):]] = sha
     return heads
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Backup records (kit 35): what this machine knows about each worktree's backup on origin
+#
+# A failed backup was silent (the 2026-11-10 check of the kit's implicit states, U10, U11 and U29): the commit hook's
+# push is quiet and always exits 0, and the reaper's results lived only in its log, so a person could walk away
+# believing work was on GitHub that was on one disk. Each writer now leaves its newest result in the worktree's own git
+# dir, one file per writer so the two never race on one file: session-backup.json (the commit hook's `session
+# wip-backup`) and worktree-reaper-backup.json (the hourly reaper). `session status` and the reaper's stuck file read
+# them. A record holds a result word, times, commit ids, a ref name and a short error: never a path or file content.
+
+BACKUP_RECORDS = {"commit": "session-backup.json", "reaper": "worktree-reaper-backup.json"}
+BACKUP_OK = ("pushed", "backed-up", "current", "on-origin")  # origin (a backup ref or a branch) holds `head`
+
+
+def _epoch(s):
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def write_backup_record(gitdir, writer, result, head="", target="", ref="", detail="", when=None):
+    """Leave this writer's newest backup result in the worktree's git dir by atomic replace. It carries the last good
+    result forward (last_ok, last_ok_head) and, while pushes fail, when the failing began (failing_since). Returns the
+    record, or None when it could not be written; never raises (a report must never break a backup)."""
+    try:
+        p = Path(gitdir) / BACKUP_RECORDS[writer]
+        try:
+            prev = json.loads(p.read_text())
+            prev = prev if isinstance(prev, dict) else {}
+        except (OSError, ValueError):
+            prev = {}
+        at = (when or datetime.now().astimezone()).isoformat(timespec="seconds")
+        rec = {"writer": writer, "result": result, "at": at, "head": head or "", "target": target or "",
+               "ref": ref or "", "detail": " ".join(str(detail or "").split())[:200]}
+        if result in BACKUP_OK:
+            rec.update(last_ok=at, last_ok_head=head or "", failing_since=None)
+        else:
+            rec.update(last_ok=prev.get("last_ok"), last_ok_head=prev.get("last_ok_head"),
+                       failing_since=prev.get("failing_since") or at)
+        tmp = p.with_name(p.name + f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(rec, indent=1) + "\n")
+        os.replace(tmp, p)
+        return rec
+    except Exception:
+        return None
+
+
+def read_backup_records(gitdir):
+    """{writer: record} for each backup record present in the worktree's git dir."""
+    out = {}
+    for writer, name in BACKUP_RECORDS.items():
+        try:
+            rec = json.loads((Path(gitdir) / name).read_text())
+        except (OSError, ValueError, TypeError):
+            continue
+        if isinstance(rec, dict):
+            out[writer] = rec
+    return out
+
+
+def stopped_rebase_branch(gitdir):
+    """The branch a rebase left open in this worktree is rebasing (rebase-merge/head-name, or rebase-apply/head-name),
+    or "" when none is open. A `session land` stopped at a conflict leaves exactly this: while the rebase is open git
+    lists the worktree as detached (checked 2026-11-10), so nothing else names the branch the work belongs to."""
+    for d in ("rebase-merge", "rebase-apply"):
+        try:
+            name = (Path(gitdir) / d / "head-name").read_text().strip()
+        except (OSError, TypeError):
+            continue
+        if name.startswith("refs/heads/"):
+            return name[len("refs/heads/"):]
+    return ""
+
+
+def backup_summary(gitdir, head, now=None):
+    """One reading of a worktree's backup from both writers' records:
+    {"state", "age_h", "failing_h", "result", "writer", "detail", "ref"}.
+    state: "current" (a writer's last good copy holds this HEAD's commits), "failing" (none does, and the newest attempt
+    failed: the work is on this machine only), "behind" (none does, and nothing has tried since HEAD moved: commits made
+    with SESSION_WIP_BACKUP=0, by land's own steps, or on a branch the commit hook skips), or "none" (no record yet).
+    age_h is the age of the newest good copy; failing_h how long the newest attempt's writer has been failing."""
+    recs = read_backup_records(gitdir) if gitdir else {}
+    now = now or time.time()
+    res = {"state": "none", "age_h": None, "failing_h": None, "result": "", "writer": "", "detail": "", "ref": ""}
+    if not recs:
+        return res
+    newest = max(recs.values(), key=lambda r: _epoch(r.get("at")) or 0)
+    res.update(result=newest.get("result", ""), writer=newest.get("writer", ""), detail=newest.get("detail", ""),
+               ref=newest.get("ref", ""))
+    good = [(_epoch(r.get("last_ok")), r) for r in recs.values() if _epoch(r.get("last_ok"))]
+    if good:
+        res["age_h"] = round((now - max(t for t, _ in good)) / 3600, 1)
+    if newest.get("result") not in BACKUP_OK and _epoch(newest.get("failing_since")):
+        res["failing_h"] = round((now - _epoch(newest["failing_since"])) / 3600, 1)
+    if head and any(r.get("last_ok_head") == head for _, r in good):
+        res["state"] = "current"
+    elif newest.get("result") not in BACKUP_OK:
+        res["state"] = "failing"
+    else:
+        res["state"] = "behind"
+    return res
 
 
 # ---------------------------------------------------------------------------------------------------------------
