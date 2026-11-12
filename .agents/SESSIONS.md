@@ -141,7 +141,8 @@ python3 .agents/bin/agent_repo_audit.py --check
 Read-only checks: read-only roots untouched (a byte-identical move that stays inside the root, a
 deletion whose bytes remain at another path under it, and an index file such as CONTEXT.md at any
 depth are not edits of an original; kit v16), generated output has its source, no session
-scratch paths in code, no two live tasks own the same path.
+scratch paths in code, no two live tasks own the same path. A new path filed under a date-named
+folder of a read-only root is a warning, never an error (kit 36, below).
 
 ## Checks run on this machine, before the push
 
@@ -488,6 +489,26 @@ The Witness events carry the new counts, never a path: `ignored_moved`, `ignored
 `status`; and on the reaper's run event `backup_failing`, `fetch_failed`, `stuck_stopped_lands` and
 `stopped_land_backup_error`, with one `org_design_tooling.worktree_backup` event per push, a stopped land's second push
 marked `stopped_land`.
+
+### A date-named folder under a read-only root is named at the land (kit 36)
+
+Folders are named for what they hold, never for the day they arrived (WS-DDR-152). The governance root's daily audit
+(Check 31) finds a date-named folder the next morning; this is the same test at the moment of filing. When
+`agent_repo_audit.py --check --against <ref>` sees a path ADDED under an `external_read_only_roots` entry (`git diff
+--name-status`, status A) whose first folder below the root starts with a date (`YYYY-MM` or `YYYY-MM-DD`) or carries
+an ISO date (`Screenshots_2025-11-21`), and that folder is not `archive/`, it prints one line per folder:
+
+```
+WARNING: date-named folder from-client/2026-11-12-pull (2 added paths): WS-DDR-152 names folders for what they hold, ...
+```
+
+It is a warning and never refuses the land: `session land` prints it with the other audit output and goes on. File the
+paths by purpose (`from-client/brand/`, `from-client/planning/`), keep the received date in the folder's `CONTEXT.md`
+row, and put superseded editions under `archive/<date>/`. A file directly under the root has no folder and is not
+named; a date deeper than the first folder is not named (a client's own subfolder keeps the name it arrived with); an
+edit or deletion is the existing error. The two patterns are Check 31's, held identical by a test in the kit's suite.
+The land's Witness event carries `date_folder_warnings`, a count (0 when the audit ran and found none), never a
+folder name.
 
 ## What the hooks enforce
 
