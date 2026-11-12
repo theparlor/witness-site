@@ -1722,6 +1722,8 @@ def cmd_land(a):
     if audit.exists():
         ar = run([sys.executable, str(audit), "--check", "--against", pin], top, check=False)
         print(ar.stdout.strip())
+        # kit 36: the date-folder warnings (WS-DDR-152) ride on this land's one Witness event, as a count only
+        EVENT["attrs"]["date_folder_warnings"] = sum(1 for l in ar.stdout.splitlines() if l.startswith("WARNING: date-named folder"))
         if ar.returncode:
             sys.exit("session: audit found errors; fix them and land again")
     run_pre_land(top, gate)  # the tree that would land: this branch rebased onto origin/<base> (kit 18)

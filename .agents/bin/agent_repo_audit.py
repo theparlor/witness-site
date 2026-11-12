@@ -23,8 +23,16 @@ Declared registers (csv_unique_key in the policy, kit 27): every CSV the change 
 glob must keep a unique key, must not carry its header again as a data row, and must not repeat a row under a
 second key. A land whose rebase conflict covered a whole appended register pushed exactly that shape on 2026-09-26
 (header swallowed as a data row, 31 rows renumbered and kept twice) while this audit reported no findings.
+
+Date-named folders (kit 36, WS-DDR-152, 2026-11-12): folders are named for what they hold, never for the day they
+arrived. For every path ADDED under a read-only root (status A in `git diff --name-status <against>...HEAD`), the
+first folder below the root is checked; one whose name starts with a date (YYYY-MM or YYYY-MM-DD) or carries an ISO
+date, other than archive/, is named in a WARNING that cites WS-DDR-152, once per folder with the count of paths added
+under it. This is the front-hall meter for the daily governance audit's Check 31 (src/governance_audit.py, the
+basement meter), and it uses Check 31's two patterns, held identical by a test. It is a warning and never refuses the
+land. A file directly under the root has no folder, so it is not named; an edit or a deletion is the existing error.
 """
-import argparse, csv, fnmatch, hashlib, json, os, subprocess, sys
+import argparse, csv, fnmatch, hashlib, json, os, re, subprocess, sys
 from pathlib import Path
 
 def git(root, *args, check=True):
@@ -34,6 +42,12 @@ ROOT = Path(git(Path(__file__).resolve().parent, "rev-parse", "--show-toplevel")
 _pol = ROOT / ".agents/repository-policy.json"
 POLICY = json.loads(_pol.read_text()) if _pol.exists() else {}
 LIVE = {"planned", "active", "review-ready", "blocked"}
+
+# A folder name that starts with a date: 2026-09-23-jci-pull, 2026-03-07_onedrive-x, 2026-07, 2026-06-21.
+BATCH_DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}(-\d{2})?([_-]|$)")
+# Any ISO date in a folder name at the top of a zone (Screenshots_2025-11-21) is the batch-by-arrival shape.
+ANY_ISO_DATE_RE = re.compile(r"(^|[^\d])\d{4}-\d{2}-\d{2}([^\d]|$)")
+ARCHIVE_DIRS = {"archive", "_archive"}   # superseded editions live under archive/<date>/ (WS-DDR-152)
 
 def match(path, pattern):
     return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path, pattern.removeprefix("**/"))
@@ -96,6 +110,14 @@ def file_sha256(path):
     except OSError:
         return ""
 
+def date_folder(path, root):
+    """The first folder below `root` that `path` is filed under, when its name is date-shaped (kit 36); else None.
+    Check 31's test: the name starts with a date, or carries an ISO date anywhere (this folder is the top of the zone)."""
+    rest = path[len(root) + 1:].split("/")
+    if len(rest) < 2 or rest[0] in ARCHIVE_DIRS: return None   # a file directly under the root has no folder
+    name = rest[0]
+    return name if BATCH_DATE_DIR_RE.match(name) or ANY_ISO_DATE_RE.search(name) else None
+
 def head_blobs(root):
     """Blob ids of every tracked path under a read-only root at HEAD."""
     out = set()
@@ -150,7 +172,7 @@ def main():
     changed = [line[3:] for line in status if len(line) > 3]
     # paths whose existing content changed (modified, deleted, renamed); additions are not in here
     altered = {line[3:].split(" -> ")[0] for line in status if len(line) > 3 and line[:2].strip() and line[:2] not in ("??", "A ", "AM")}
-    moved, deleted = {}, set()   # committed renames old -> (new, similarity); committed deletions
+    moved, deleted, added = {}, set(), set()   # committed renames old -> (new, similarity); deletions; additions (kit 36)
     if a.against:
         changed = sorted(set(changed) | set(x for x in git(ROOT, "diff", "--name-only", f"{a.against}...HEAD", check=False).split("\n") if x))
         for line in git(ROOT, "diff", "--name-status", f"{a.against}...HEAD", check=False).splitlines():
@@ -160,6 +182,8 @@ def main():
             if kind == "R" and len(parts) > 2:
                 moved[parts[1]] = (parts[2], int(parts[0][1:] or 0))
                 altered.add(parts[1])
+            elif kind == "A":
+                added.add(parts[1])
             elif kind == "D":
                 deleted.add(parts[1]); altered.add(parts[1])
             elif kind in "MT":
@@ -202,6 +226,15 @@ def main():
                     if blob and blob in blobs: continue
                 hits.append(x)
             if hits: errors.append(f"external read-only paths modified, deleted or renamed under {root}: {', '.join(hits[:8])}")
+            # kit 36: the warning at the moment of filing (WS-DDR-152); the daily Check 31 is the same test, later
+            folders = {}
+            for x in sorted(added):
+                f = date_folder(x, root) if under(x, root) else None
+                if f: folders[f] = folders.get(f, 0) + 1
+            for f, n in sorted(folders.items()):
+                warnings.append(f"date-named folder {root}/{f} ({n} added path{'' if n == 1 else 's'}): WS-DDR-152 names folders "
+                                "for what they hold, never for the day they arrived (AGENTS.md section 4a); file these by purpose "
+                                "and keep the received date in the CONTEXT.md row. A warning only: it never refuses the land")
         for m in POLICY.get("generator_maps", []):
             output = any(match(x, pat) for x in changed for pat in m["outputs"])
             source = any(x in m["sources"] for x in changed)
