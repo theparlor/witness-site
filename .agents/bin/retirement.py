@@ -37,6 +37,15 @@ checkout, or $WORKSPACES_ROOT), so a retirement there neither fails nor repeats.
 Kit 35: `session finish` keeps ignored files with the same three helpers (ignored_plan, keep_aside, carry_ignored)
 before its own `git worktree remove`, and the backup records (write_backup_record, backup_summary) live here so the
 commit hook's push, the reaper and `session status` read one format.
+
+Kit 37 (S0-07; the 2026-11-09 resilient ways of working design, T-C11 and T-SEC4): unlanded work never goes to an
+origin that is public or whose visibility cannot be told. origin_visibility() reads the repository policy's
+`visibility` first, then the reaper's day-long cache, then GitHub's public API without credentials (a private
+repository answers 404); "unknown" is treated as public for these pushes, so a network error never pushes unlanded
+work to a possibly public origin. On such an origin the commit hook's backup and retire's archive tag go to the
+private backup remote when the policy names one (`private_backup_remote`); otherwise the work stays on this machine
+(a local tag; the backup record says kept-local, not remotely durable) and retire's ledger row and manifest land in
+the Workspaces root, as for an archived origin, never on the public repository's main.
 """
 import filecmp
 import hashlib
@@ -63,6 +72,8 @@ DROP_PARTS = {".venv", "venv", "node_modules", "__pycache__", ".pytest_cache", "
 DROP_PREFIXES = (".entire/tmp/", ".entire/logs/")
 DROP_NAMES = {".DS_Store"}
 ARCHIVED_RE = re.compile(r"archived|read-only", re.I)
+VISIBILITY_TTL_S = 86400  # a visibility read is cached a day per clone, in the file the reaper's own read uses
+GITHUB_API = "https://api.github.com"  # SESSION_GITHUB_API overrides it (tests point it at a local stand-in)
 LEDGER_HEAD = """---
 title: Retirement ledger
 type: reference
@@ -162,12 +173,93 @@ def workspaces_root(start):
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# Visibility (kit 37): where unlanded work may be pushed
+
+def github_slug(url):
+    m = re.match(r"^(?:git@github\.com:|ssh://git@github\.com/|https://(?:[^@/]+@)?github\.com/)([^/]+/[^/]+?)(?:\.git)?/?$",
+                 url or "")
+    return m.group(1) if m else None
+
+
+def _policy(repo):
+    try:
+        got = json.loads((Path(repo) / ".agents" / "repository-policy.json").read_text())
+        return got if isinstance(got, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _visibility_cache(repo):
+    rc, common, _ = git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return Path(common) / STATE_DIR / "visibility.json" if rc == 0 and common else None
+
+
+def origin_visibility(repo):
+    """"private", "public" or "unknown" for this checkout's origin. In order: the repository policy's `visibility`
+    ("public" or "private"), the day-long cache in the clone's git dir (the reaper's file and format), then GitHub's
+    public API asked without credentials (404 means private). An origin that is no GitHub repository (a path, another
+    host) holds nothing public: "private". Never raises; any failure is "unknown". A policy that says private never
+    outvotes a cached reading of public."""
+    try:
+        pol = str(_policy(repo).get("visibility", "")).strip().lower()
+        if pol == "public":
+            return "public"
+        rc, url, _ = git(repo, "config", "--get", "remote.origin.url")
+        if rc or not url:
+            return "unknown"
+        slug = github_slug(url)
+        if slug is None:
+            return "private"
+        cache = _visibility_cache(repo)
+        cached = None
+        try:
+            got = json.loads(cache.read_text()) if cache else {}
+            if got.get("slug") == slug and time.time() - got.get("at", 0) < VISIBILITY_TTL_S:
+                cached = "private" if got["private"] else "public"
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        if pol == "private":
+            return "public" if cached == "public" else "private"
+        if cached:
+            return cached
+        import urllib.error
+        import urllib.request
+        api = os.environ.get("SESSION_GITHUB_API", "").strip() or GITHUB_API
+        req = urllib.request.Request(f"{api.rstrip('/')}/repos/{slug}",
+                                     headers={"Accept": "application/vnd.github+json", "User-Agent": "session-kit"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as r:
+                private = bool(json.loads(r.read().decode()).get("private", True))
+        except urllib.error.HTTPError as e:
+            if e.code != 404:
+                return "unknown"
+            private = True
+        except (OSError, ValueError):
+            return "unknown"
+        if cache:
+            try:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(json.dumps({"slug": slug, "private": private, "at": time.time()}))
+            except OSError:
+                pass
+        return "private" if private else "public"
+    except Exception:
+        return "unknown"
+
+
+def private_backup_remote(repo):
+    """The policy's `private_backup_remote` (a remote name of this clone, or a URL), or "" when none is named."""
+    v = _policy(repo).get("private_backup_remote", "")
+    return v.strip() if isinstance(v, str) else ""
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # Pushing, tags and the backup ref
 
-def push(cwd, *refspecs, timeout=GIT_TIMEOUT):
-    """Push to origin. Raises OriginArchived when GitHub refuses because the repository is archived, RuntimeError
-    for any other refusal."""
-    rc, _, err = git(cwd, "push", "-q", "origin", *refspecs, timeout=timeout)
+def push(cwd, *refspecs, timeout=GIT_TIMEOUT, remote="origin"):
+    """Push to origin (or `remote`). Raises OriginArchived when GitHub refuses because the repository is archived,
+    RuntimeError for any other refusal."""
+    rc, _, err = git(cwd, "push", "-q", remote, *refspecs, timeout=timeout)
     if rc == 0:
         return
     msg = " ".join(err.split())
@@ -180,8 +272,9 @@ def tag_name(branch, folder, date):
     return f"archive/{branch}-{date}" if branch else f"archive/detached-{folder}-{date}"
 
 
-def ensure_tag(primary, tag, sha):
-    """Create (or reuse when it already pins `sha`) the archive tag and push it. Returns the tag actually used.
+def ensure_tag(primary, tag, sha, remote="origin"):
+    """Create (or reuse when it already pins `sha`) the archive tag and push it (to origin, or `remote`; None pushes
+    nothing and keeps the tag local). Returns the tag actually used.
     Raises OriginArchived with .tag set when origin is read-only: the tag then exists locally only."""
     name, n = tag, 1
     while True:
@@ -195,8 +288,10 @@ def ensure_tag(primary, tag, sha):
             break
         n += 1
         name = f"{tag}-{n}"
+    if remote is None:
+        return name
     try:
-        push(primary, f"refs/tags/{name}")
+        push(primary, f"refs/tags/{name}", remote=remote)
     except OriginArchived as e:
         e.tag = name
         raise
@@ -239,7 +334,9 @@ def wip_heads(cwd, timeout=60):
 # them. A record holds a result word, times, commit ids, a ref name and a short error: never a path or file content.
 
 BACKUP_RECORDS = {"commit": "session-backup.json", "reaper": "worktree-reaper-backup.json"}
-BACKUP_OK = ("pushed", "backed-up", "current", "on-origin")  # origin (a backup ref or a branch) holds `head`
+BACKUP_OK = ("pushed", "backed-up", "current", "on-origin",  # origin (a backup ref or a branch) holds `head`
+             "pushed-private")  # kit 37: the private backup remote holds it (origin is public or unknown)
+KEPT_LOCAL = "kept-local"  # kit 37: origin is public or unknown and no private backup remote is named: this machine only
 
 
 def _epoch(s):
@@ -308,7 +405,9 @@ def backup_summary(gitdir, head, now=None):
     {"state", "age_h", "failing_h", "result", "writer", "detail", "ref"}.
     state: "current" (a writer's last good copy holds this HEAD's commits), "failing" (none does, and the newest attempt
     failed: the work is on this machine only), "behind" (none does, and nothing has tried since HEAD moved: commits made
-    with SESSION_WIP_BACKUP=0, by land's own steps, or on a branch the commit hook skips), or "none" (no record yet).
+    with SESSION_WIP_BACKUP=0, by land's own steps, or on a branch the commit hook skips), "local" (kit 37: none does,
+    and the newest attempt withheld the push on purpose because origin is public or of unknown visibility), or "none"
+    (no record yet).
     age_h is the age of the newest good copy; failing_h how long the newest attempt's writer has been failing."""
     recs = read_backup_records(gitdir) if gitdir else {}
     now = now or time.time()
@@ -325,6 +424,8 @@ def backup_summary(gitdir, head, now=None):
         res["failing_h"] = round((now - _epoch(newest["failing_since"])) / 3600, 1)
     if head and any(r.get("last_ok_head") == head for _, r in good):
         res["state"] = "current"
+    elif newest.get("result") == KEPT_LOCAL:
+        res["state"] = "local"
     elif newest.get("result") not in BACKUP_OK:
         res["state"] = "failing"
     else:
@@ -936,6 +1037,19 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
             rec["reason"] += (f"; {len(plan['replace'])} newer ignored copy(ies) would take the primary's place and "
                               f"{len(plan['aside'])} older one(s) would be set aside, both sides archived")
         return rec
+    # kit 37: unlanded work goes to origin only when origin is known to be private. Read before anything changes, so a
+    # public or unknown origin with nowhere private for the record refuses with the worktree exactly as it was.
+    vis = origin_visibility(primary)
+    dest = "origin" if vis == "private" else (private_backup_remote(primary) or None)
+    withheld = vis != "private"  # the record of unlanded work stays off a public main too
+    rec.update(origin_visibility=vis, tag_remote=("origin" if dest == "origin" else "private_backup_remote"
+                                                  if dest else "local"), remote_durable=dest is not None)
+    if withheld:
+        ws0 = Path(root) if root else workspaces_root(primary)
+        if ws0 is None or os.path.realpath(ws0) == os.path.realpath(primary) or origin_visibility(ws0) != "private":
+            rec["reason"] = (f"origin is {vis}, so this unlanded work is not pushed there, and no Workspaces root with a "
+                             "private origin was found to hold its ledger row and manifest; nothing was changed")
+            return rec
     os.environ["SESSION_WIP_BACKUP"] = "0"  # this process's own commits push no backup ref
     when = datetime.fromtimestamp(now) if now else datetime.now()
     date = when.strftime("%Y-%m-%d")
@@ -949,10 +1063,10 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
         tag = tag_name(branch, wt.name, date)
         archived = False
         try:
-            tag = ensure_tag(primary, tag, head)
+            tag = ensure_tag(primary, tag, head, remote=dest)
         except OriginArchived as e:
             tag, archived = getattr(e, "tag", tag), True
-        rec.update(tag=tag, archived=archived, snapshot_commit=snap or "")
+        rec.update(tag=tag, archived=archived, withheld=withheld, snapshot_commit=snap or "")
         residue = empty_residue()
         residue["snapshot"], residue["carry"], residue["dup"] = rec["snapshot"], plan["carry"], plan["dup"]
         residue["replace"], residue["aside"] = plan["replace"], plan["aside"]
@@ -965,14 +1079,22 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
                     + (f"; {len(rec['snapshot'])} uncommitted path(s) in its snapshot" if rec["snapshot"] else "")}
         stamp = when.strftime("%H%M")
         message = (f"retire: {wt.name}, work not on main, kept on {tag}\n\n{reason or 'retired by hand'}")
-        if archived:
+        if archived or withheld:
             ws = Path(root) if root else workspaces_root(primary)
             if ws is None or os.path.realpath(ws) == os.path.realpath(primary):
-                raise RuntimeError("origin is archived and no Workspaces root was found to hold the ledger row; the "
+                raise RuntimeError(("origin is archived" if archived else f"origin is {vis}")
+                                   + " and no Workspaces root was found to hold the ledger row; the "
                                    f"tag {tag} is local; nothing else was changed")
+            if withheld and origin_visibility(ws) != "private":
+                raise RuntimeError(f"origin is {vis} and the Workspaces root's origin is not known to be private, so "
+                                   f"there is nowhere private for the ledger row; the tag {tag} is local; nothing else "
+                                   "was changed")
             rel = os.path.relpath(primary, ws)
             c["repo_note"] = (f"`{rel}` (its origin on GitHub is archived, read-only, so the tag lives only in this "
-                              "machine's clone and this record is kept in the Workspaces root)")
+                              "machine's clone and this record is kept in the Workspaces root)" if archived else
+                              f"`{rel}` (its origin is {vis}, so this unlanded work is not pushed there: the tag is "
+                              + ("on the private backup remote" if dest else "only in this machine's clone, not "
+                                 "remotely durable") + ", and this record is kept in the Workspaces root)")
             c["name"] = f"{Path(rel).name}/{wt.name}"
             route, ref = land_record(ws, default_branch(ws), build_record(ws, default_branch(ws), [c], date, stamp,
                                                                            source=source, intro=RETIRE_INTRO), message)
@@ -984,7 +1106,7 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
         rec["kept_aside"] = aside_rel or ""
         rec["moved_files"] = carry_ignored(primary, wt, plan["carry"])
         rec["freed_mb"] = remove_worktree(primary, wt, branch, tag)
-        rec["wip_dropped"] = False if archived else drop_wip(primary, branch)
+        rec["wip_dropped"] = False if archived or withheld else drop_wip(primary, branch)
         rec["action"] = "retired"
         rec["reason"] = reason or "retired by hand"
     except (RuntimeError, OSError) as e:

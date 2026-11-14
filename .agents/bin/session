@@ -1015,7 +1015,8 @@ def backup_line(b):
     if b["state"] == "current":
         local = ("; its uncommitted files stay on this machine (a public repository gets the committed tip only)"
                  if "uncommitted kept local" in (b.get("detail") or "") else "")
-        return f"backup: current on origin ({b.get('ref') or 'refs/wip'}), {age}" + (f", by {who}" if who else "") + local
+        where = "the private backup remote" if b.get("result") == "pushed-private" else "origin"
+        return f"backup: current on {where} ({b.get('ref') or 'refs/wip'}), {age}" + (f", by {who}" if who else "") + local
     if b["state"] == "failing":
         since = f" for {span(b['failing_h'])}" if b.get("failing_h") is not None else ""
         why = f" ({b['result']}: {b['detail'][:120]})" if b.get("detail") else f" ({b['result']})"
@@ -1023,6 +1024,10 @@ def backup_line(b):
     if b["state"] == "behind":
         return (f"backup: BEHIND: HEAD has commits no backup holds; {age}. A commit made with SESSION_WIP_BACKUP=0, by "
                 "a land's own step, or on a branch outside agent/ and claude/ pushes none; the hourly reaper catches up")
+    if b["state"] == "local":
+        return (f"backup: KEPT LOCAL: origin is public or its visibility could not be told, so the commit hook does not "
+                f"push unlanded work there (kit 37); this work is on this machine only, not remotely durable; {age}. "
+                "Name a private remote as private_backup_remote in .agents/repository-policy.json to back it up")
     return "backup: none recorded on this machine yet"
 
 
@@ -1042,7 +1047,7 @@ def backup_readings(ss):
             s["stopped_land"] = rt.stopped_rebase_branch(gd) if gd else ""
         except Exception:
             continue
-    for k in ("current", "behind", "failing", "none"):
+    for k in ("current", "behind", "failing", "local", "none"):
         EVENT["attrs"][f"backup_{k}"] = sum(1 for s in ss if (s.get("backup") or {}).get("state") == k)
     EVENT["attrs"]["stopped_lands"] = sum(1 for s in ss if s.get("stopped_land"))
 
@@ -1669,6 +1674,46 @@ def signal_stub_check(top, primary, pin, task, branch, base):
               f"(reported to Witness)")
 
 
+def land_gates(a, top, primary, pin, task_rec, branch, base, verdict, retry=False):
+    """Every check a land runs on the tree it would push: the signal stub, KF-11, the repository audit, the
+    repository's own pre-land commands and the portability check. Returns kf11_check's (agent, content, pr reason).
+
+    Kit 37 (V1, 31-session-kit-implicit-states.md U5): until kit 36 the retry after a push race (a sibling landed
+    between this land's checks and its push) reran only the pre-land commands and the portability check, so a tree
+    the audit refuses (a register with a key used twice, an ownership overlap) could reach main. The retry now calls
+    this same function. The first run's signal stub result is kept on a retry: the stub it wrote is in the change,
+    so the second run reports skipped_has_signal for the same stub."""
+    if retry:
+        EVENT["attrs"]["land_gate_runs"] = EVENT["attrs"].get("land_gate_runs", 1) + 1
+        first_stub = EVENT["attrs"].get("signal_stub")
+    else:
+        EVENT["attrs"]["land_gate_runs"] = 1
+    # The signal stub (kit 33) comes first, so KF-11 counts it and the gates judge it with the rest
+    signal_stub_check(top, primary, pin, task_rec, branch, base)
+    if retry and first_stub and EVENT["attrs"].get("signal_stub") == "skipped_has_signal":
+        EVENT["attrs"]["signal_stub"] = first_stub
+    # KF-11 (kit 23): measured on the rebased tree, before the gates, so its handoff commit is judged with the rest
+    kf = kf11_check(a, top, primary, pin, task_rec, branch, verdict)
+    gate = pre_land_commands(top)  # read first: a broken declaration stops the land with its own reason
+    audit = top / ".agents" / "bin" / "agent_repo_audit.py"
+    if audit.exists():
+        ar = run([sys.executable, str(audit), "--check", "--against", pin], top, check=False)
+        print(ar.stdout.strip())
+        # kit 36: the date-folder warnings (WS-DDR-152) ride on this land's one Witness event, as a count only
+        EVENT["attrs"]["date_folder_warnings"] = sum(1 for l in ar.stdout.splitlines() if l.startswith("WARNING: date-named folder"))
+        if ar.returncode:
+            if retry:
+                EVENT["attrs"]["reason"] = "audit_after_rebase"
+                sys.exit("session: audit found errors after the rebase onto another session's landing; nothing was "
+                         "pushed; fix them and land again")
+            sys.exit("session: audit found errors; fix them and land again")
+    run_pre_land(top, gate)  # the tree that would land: this branch rebased onto origin/<base> (kit 18)
+    if not portability_check(top):
+        sys.exit("session: portability check failed" + (" after the rebase" if retry else
+                 " (the check CI used to run on every push)") + "; fix it and land again")
+    return kf
+
+
 def cmd_land(a):
     top, primary, linked = here(a.here)
     if not linked:
@@ -1713,22 +1758,7 @@ def cmd_land(a):
         print(f"nothing new to land: everything on this branch is already on origin/{base}")
         return 0
     task_rec = json.loads(t.read_text()) if t and t.is_file() else {}
-    # The signal stub (kit 33) comes first, so KF-11 counts it and the gates judge it with the rest
-    signal_stub_check(top, primary, pin, task_rec, branch, base)
-    # KF-11 (kit 23): measured on the rebased tree, before the gates, so its handoff commit is judged with the rest
-    kf_agent, kf_content, kf_pr = kf11_check(a, top, primary, pin, task_rec, branch, verdict)
-    gate = pre_land_commands(top)  # read first: a broken declaration stops the land with its own reason
-    audit = top / ".agents" / "bin" / "agent_repo_audit.py"
-    if audit.exists():
-        ar = run([sys.executable, str(audit), "--check", "--against", pin], top, check=False)
-        print(ar.stdout.strip())
-        # kit 36: the date-folder warnings (WS-DDR-152) ride on this land's one Witness event, as a count only
-        EVENT["attrs"]["date_folder_warnings"] = sum(1 for l in ar.stdout.splitlines() if l.startswith("WARNING: date-named folder"))
-        if ar.returncode:
-            sys.exit("session: audit found errors; fix them and land again")
-    run_pre_land(top, gate)  # the tree that would land: this branch rebased onto origin/<base> (kit 18)
-    if not portability_check(top):
-        sys.exit("session: portability check failed (the check CI used to run on every push); fix it and land again")
+    kf_agent, kf_content, kf_pr = land_gates(a, top, primary, pin, task_rec, branch, base, verdict)
     changed = name_list(top, "--no-renames", f"{pin}...HEAD")
     EVENT["attrs"]["files"] = len(changed)
     # Local landing is the default (WS-DDR-143 amendment 2026-09-24): the checks already ran here,
@@ -1773,9 +1803,11 @@ def cmd_land(a):
             pin = rebase_on_base(top, base, branch)
             if not pin:
                 return 3
-            run_pre_land(top, pre_land_commands(top))  # a new tree: the other session's landing is in it
-            if not portability_check(top):
-                sys.exit("session: portability check failed after the rebase; fix it and land again")
+            # a new tree: the other session's landing is in it, so every gate judges it again (kit 37, V1)
+            kf_agent, kf_content, kf_pr = land_gates(a, top, primary, pin, task_rec, branch, base, verdict, retry=True)
+            if kf_pr:
+                why_pr = kf_pr
+                break
         else:
             sys.exit(f"session: origin/{base} kept moving; run `python3 .agents/bin/session land` again")
     EVENT["attrs"]["route"] = "pr"
@@ -1944,14 +1976,23 @@ def wip_ref(branch):
 
 
 def drop_wip(cwd, branch):
-    """Delete the branch's backup ref on origin. Quiet and fail-open: a missing ref or no network is fine."""
+    """Delete the branch's backup ref on origin, and on the private backup remote when the policy names one (kit 37).
+    Quiet and fail-open: a missing ref or no network is fine."""
     if not branch or not branch.startswith(WIP_BRANCHES):
         return
+    remotes = ["origin"]
     try:
-        subprocess.run(["git", "push", "-q", "origin", f":{wip_ref(branch)}"], cwd=cwd, capture_output=True,
-                       timeout=60, env=wip_env())
-    except (OSError, subprocess.TimeoutExpired):
+        extra = load_retirement().private_backup_remote(cwd)
+        if extra and extra != "origin":
+            remotes.append(extra)
+    except (Exception, SystemExit):
         pass
+    for remote in remotes:
+        try:
+            subprocess.run(["git", "push", "-q", remote, f":{wip_ref(branch)}"], cwd=cwd, capture_output=True,
+                           timeout=60, env=wip_env())
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def wip_env():
@@ -1960,6 +2001,21 @@ def wip_env():
     if not (env.get("GIT_SSH_COMMAND") or env.get("GIT_SSH")):
         env["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=15"
     return env
+
+
+def backup_destination(top):
+    """(remote or None, origin visibility). Kit 37 (S0-07): unlanded commits go to origin only when origin is known to
+    be private. A public origin, or one whose visibility cannot be told now (unknown counts as public here, so a
+    network error never sends unlanded work to a possibly public repository), gets nothing: the push goes to the
+    policy's private_backup_remote when one is named, else nowhere (None) and the work stays on this machine."""
+    try:
+        rt = load_retirement()
+        vis = rt.origin_visibility(top)
+        if vis == "private":
+            return "origin", vis
+        return (rt.private_backup_remote(top) or None), vis
+    except (Exception, SystemExit):
+        return None, "unknown"
 
 
 def cmd_wip_backup(a):
@@ -1974,6 +2030,17 @@ def cmd_wip_backup(a):
         return 0
     lock = Path(git(top, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)) / "wip-backup.lock"
     gitdir = git(top, "rev-parse", "--path-format=absolute", "--git-dir", check=False, env=READ_ONLY)
+    remote, vis = backup_destination(top)
+    EVENT["attrs"]["origin_visibility"] = vis
+    if remote is None:
+        EVENT["attrs"]["decision"] = "kept_local"
+        tip = git(top, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False, env=READ_ONLY)
+        record_backup(gitdir, "kept-local", tip, branch,
+                      f"origin is {vis}; unlanded commits are not pushed there and no private_backup_remote is named; "
+                      "on this machine only")
+        if not a.quiet:
+            print(f"session: backup of {branch} kept on this machine: origin is {vis} (kit 37)", file=sys.stderr)
+        return 0
     import fcntl
     with open(lock, "a") as fh:
         deadline = time.monotonic() + WIP_TIMEOUT
@@ -1991,7 +2058,7 @@ def cmd_wip_backup(a):
                 time.sleep(0.2)
         tip = git(top, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False, env=READ_ONLY)
         try:
-            r = subprocess.run(["git", "push", "-q", "origin", f"+{tip or 'refs/heads/' + branch}:{wip_ref(branch)}"],
+            r = subprocess.run(["git", "push", "-q", remote, f"+{tip or 'refs/heads/' + branch}:{wip_ref(branch)}"],
                                cwd=top, capture_output=True, text=True, timeout=WIP_TIMEOUT, env=wip_env())
             err, rc = (r.stderr or r.stdout).strip(), r.returncode
         except subprocess.TimeoutExpired:
@@ -1999,7 +2066,7 @@ def cmd_wip_backup(a):
         except OSError as e:
             err, rc = str(e), 127
     if rc == 0:
-        EVENT["attrs"]["decision"] = "pushed"
+        EVENT["attrs"]["decision"] = "pushed" if remote == "origin" else "pushed-private"
     else:
         EVENT["outcome"] = "error"
         EVENT["attrs"]["decision"] = ("offline" if re.search(r"resolve host|timed out|Network is unreachable|"
@@ -2061,6 +2128,7 @@ def cmd_retire(a):
                     source="session-retire", kind=kind, dry_run=a.dry_run)
     EVENT["attrs"].update(action=rec["action"], snapshot_files=len(rec.get("snapshot") or []),
                           archived=bool(rec.get("archived")), route=rec.get("route", ""),
+                          origin_visibility=rec.get("origin_visibility", ""), tag_remote=rec.get("tag_remote", ""),
                           freed_mb=rec.get("freed_mb") or 0, dry_run=bool(a.dry_run))
     if rec["action"] == "would-retire":
         print(f"would retire {wt}: {rec['reason']}; nothing changed (dry run)")
@@ -2072,6 +2140,10 @@ def cmd_retire(a):
               + (" apart from what the message names" if rec["action"] == "error" else ""), file=sys.stderr)
         return 1
     where = ("tag kept LOCAL (origin is archived); ledger row in the Workspaces root" if rec.get("archived")
+             else (f"origin is {rec.get('origin_visibility')}, so the tag is "
+                   + ("on the private backup remote" if rec.get("remote_durable") else
+                      "kept LOCAL, on this machine only (not remotely durable)")
+                   + "; ledger row in the Workspaces root") if rec.get("withheld")
              else f"tag pushed; ledger row {'landed' if rec.get('route') == 'pushed' else 'in PR ' + str(rec.get('record'))}")
     print(f"retired {wt}\n  tag: {rec['tag']} ({where})\n  snapshot: {len(rec['snapshot'])} uncommitted path(s) "
           f"folded in\n  recover: git checkout -b {rec.get('branch') or '<branch>'} {rec['tag']}")
