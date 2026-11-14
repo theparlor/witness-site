@@ -1015,7 +1015,8 @@ def backup_line(b):
     if b["state"] == "current":
         local = ("; its uncommitted files stay on this machine (a public repository gets the committed tip only)"
                  if "uncommitted kept local" in (b.get("detail") or "") else "")
-        where = "the private backup remote" if b.get("result") == "pushed-private" else "origin"
+        where = "the private backup remote" if b.get("result") == "pushed-private" or \
+            "on the private backup remote" in (b.get("detail") or "") else "origin"
         return f"backup: current on {where} ({b.get('ref') or 'refs/wip'}), {age}" + (f", by {who}" if who else "") + local
     if b["state"] == "failing":
         since = f" for {span(b['failing_h'])}" if b.get("failing_h") is not None else ""
@@ -1026,7 +1027,7 @@ def backup_line(b):
                 "a land's own step, or on a branch outside agent/ and claude/ pushes none; the hourly reaper catches up")
     if b["state"] == "local":
         return (f"backup: KEPT LOCAL: origin is public or its visibility could not be told, so the commit hook does not "
-                f"push unlanded work there (kit 37); this work is on this machine only, not remotely durable; {age}. "
+                f"push unlanded work there (kit 37) and neither does the hourly reaper (kit 38); this work is on this machine only, not remotely durable; {age}. "
                 "Name a private remote as private_backup_remote in .agents/repository-policy.json to back it up")
     return "backup: none recorded on this machine yet"
 
@@ -2009,11 +2010,7 @@ def backup_destination(top):
     network error never sends unlanded work to a possibly public repository), gets nothing: the push goes to the
     policy's private_backup_remote when one is named, else nowhere (None) and the work stays on this machine."""
     try:
-        rt = load_retirement()
-        vis = rt.origin_visibility(top)
-        if vis == "private":
-            return "origin", vis
-        return (rt.private_backup_remote(top) or None), vis
+        return load_retirement().backup_destination(top)  # kit 38: the one gate, shared with retire and the reaper
     except (Exception, SystemExit):
         return None, "unknown"
 

@@ -12,6 +12,37 @@
 # beside any post-commit hook the repo has; on a git before 2.54 a .git/hooks/post-commit shim, only where none exists.
 # Never blocks or fails a commit: it returns at once, the push runs detached and quiet, and offline it just fails.
 # SESSION_WIP_BACKUP=0 turns it off for one command.
+# Kit 38 (2026-11-14): every commit's new and changed files are rated on the ladder Brien ratified (ATT-007,
+# ATT-008: exposure, loss, label, circle). The classifier, repo-kit/ladder/classify.py in org-design-tooling, writes
+# one git note on refs/notes/ladder for the commit, detached and quiet; it never blocks or fails a commit, adds no
+# wait beyond starting it, and the tree is never touched. LADDER_RATE=0 turns it off for one command.
+# Where: $LADDER_CLASSIFIER, else the Workspaces root ($WORKSPACES_ROOT, else ~/Workspaces) plus the kit's path;
+# $LADDER_PYTHON, else org-design-tooling's .venv python when present (the classifier needs PyYAML), else python3.
+# A failed rating is counted, never hidden: a classifier that is absent or exits non-zero appends one line
+# (UTC time, commit, exit code) to ladder-rate-failures in the clone's common git dir, which the kit's audit
+# (agent_repo_audit.py) reports at every land; the classifier's own Witness event says the same.
+if [ "${LADDER_RATE:-1}" != "0" ]; then
+  ltop=$(git rev-parse --show-toplevel 2>/dev/null)
+  lgd=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+  lrev=$(git rev-parse -q --verify HEAD 2>/dev/null)
+  lcls="${LADDER_CLASSIFIER:-${WORKSPACES_ROOT:-$HOME/Workspaces}/Core/products/org-design-tooling/repo-kit/ladder/classify.py}"
+  lpy="${LADDER_PYTHON:-${lcls%/repo-kit/ladder/classify.py}/.venv/bin/python}"
+  [ -x "$lpy" ] || lpy=$(command -v python3)
+  if [ -n "$ltop" ] && [ -n "$lgd" ] && [ -n "$lrev" ]; then
+    (
+      unset GIT_INDEX_FILE  # a partial commit's temporary index is gone by the time the rating runs
+      if [ -n "$lpy" ] && [ -f "$lcls" ]; then
+        "$lpy" "$lcls" commit --repo "$ltop" --rev "$lrev"
+        lrc=$?
+      else
+        lrc=127
+      fi
+      if [ "$lrc" != "0" ]; then
+        printf '%s %s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$lrev" "$lrc" >> "$lgd/ladder-rate-failures"
+      fi
+    ) </dev/null >/dev/null 2>&1 &
+  fi
+fi
 [ "${SESSION_WIP_BACKUP:-1}" = "0" ] && exit 0
 branch=$(git symbolic-ref --short -q HEAD 2>/dev/null) || exit 0
 case "$branch" in

@@ -31,6 +31,11 @@ date, other than archive/, is named in a WARNING that cites WS-DDR-152, once per
 under it. This is the front-hall meter for the daily governance audit's Check 31 (src/governance_audit.py, the
 basement meter), and it uses Check 31's two patterns, held identical by a test. It is a warning and never refuses the
 land. A file directly under the root has no folder, so it is not named; an edit or a deletion is the existing error.
+
+Ladder rating failures (kit 38, 2026-11-14): the post-commit hook rates each commit's new and changed files
+(org-design-tooling repo-kit/ladder/classify.py, a git note on refs/notes/ladder) detached, and appends one line to
+ladder-rate-failures in the clone's common git dir whenever the classifier is absent or fails. --check reports the
+count as a WARNING at every land (never a refusal), so a rating that silently stopped is seen.
 """
 import argparse, csv, fnmatch, hashlib, json, os, re, subprocess, sys
 from pathlib import Path
@@ -43,7 +48,7 @@ _pol = ROOT / ".agents/repository-policy.json"
 POLICY = json.loads(_pol.read_text()) if _pol.exists() else {}
 LIVE = {"planned", "active", "review-ready", "blocked"}
 
-# A folder name that starts with a date: 2026-09-23-jci-pull, 2026-03-07_onedrive-x, 2026-07, 2026-06-21.
+# A folder name that starts with a date: 2026-09-23-data-pull, 2026-03-07_onedrive-x, 2026-07, 2026-06-21.
 BATCH_DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}(-\d{2})?([_-]|$)")
 # Any ISO date in a folder name at the top of a zone (Screenshots_2025-11-21) is the batch-by-arrival shape.
 ANY_ISO_DATE_RE = re.compile(r"(^|[^\d])\d{4}-\d{2}-\d{2}([^\d]|$)")
@@ -159,6 +164,15 @@ def csv_findings(path, keycol):
         else: bodies.setdefault(body, n)
     return out
 
+def ladder_failures():
+    """(count, newest line) of ladder-rate-failures in the common git dir; (0, "") when there is none (kit 38)."""
+    common = git(ROOT, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False).strip()
+    try:
+        lines = [x for x in (Path(common) / "ladder-rate-failures").read_text().splitlines() if x.strip()]
+    except OSError:
+        return 0, ""
+    return len(lines), (lines[-1] if lines else "")
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--preflight", action="store_true")
@@ -258,6 +272,14 @@ def main():
                     errors.append(f"csv_unique_key: {x} has {len(found)} finding(s): " + "; ".join(found[:5]) +
                                   ("" if len(found) <= 5 else f"; and {len(found) - 5} more"))
             notes.append(f"csv_unique_key: {checked} declared register(s) in this change checked")
+        lf, newest = ladder_failures()
+        if lf:
+            warnings.append(f"ladder rating failed {lf} time(s) at commit in this clone (newest: {newest}; time, commit, "
+                            "exit code; 127 means the classifier is not on this machine), counted by the post-commit "
+                            "hook in ladder-rate-failures in the common git dir. List what no note rates with "
+                            "classify.py check --repo <this repo>. A warning only: it never refuses the land")
+        else:
+            notes.append("ladder rating: no failed rating recorded in this clone")
         if changed and not any(x.startswith(".agents/handoffs/") for x in changed):
             warnings.append("no task handoff is present in the change set")
         # Only an overlap involving this change's own task blocks; older overlaps are reported, not fatal.
