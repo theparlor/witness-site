@@ -253,6 +253,22 @@ def private_backup_remote(repo):
     return v.strip() if isinstance(v, str) else ""
 
 
+def backup_destination(repo, visibility=None):
+    """(remote or None, origin visibility): where unlanded work from this clone may be pushed. THE one gate for it
+    (kit 37 for the commit hook and retire, kit 38 for the hourly reaper too). Unlanded work goes to origin only when
+    origin is known to be private. A public origin, or one whose visibility cannot be told now (unknown counts as
+    public, so a network error never sends unlanded work to a possibly public repository), gets nothing: the push goes
+    to the policy's private_backup_remote when one is named, else nowhere (None) and the work stays on this machine.
+    `visibility` is a reading already taken (the reaper's test switch); otherwise origin_visibility() is asked."""
+    try:
+        vis = visibility if visibility in ("private", "public", "unknown") else origin_visibility(repo)
+        if vis == "private":
+            return "origin", vis
+        return (private_backup_remote(repo) or None), vis
+    except Exception:  # noqa: BLE001 - never raises: a failure keeps the work on this machine
+        return None, "unknown"
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Pushing, tags and the backup ref
 
@@ -310,9 +326,9 @@ def drop_wip(cwd, branch, timeout=60):
     return rc == 0 or "remote ref does not exist" in err or "unable to delete" in err
 
 
-def wip_heads(cwd, timeout=60):
-    """{branch: sha} of every backup ref on origin, or None when origin cannot be asked."""
-    rc, out, _ = git(cwd, "ls-remote", "origin", f"{WIP_NS}*", timeout=timeout)
+def wip_heads(cwd, timeout=60, remote="origin"):
+    """{branch: sha} of every backup ref on origin (or `remote`), or None when it cannot be asked."""
+    rc, out, _ = git(cwd, "ls-remote", remote, f"{WIP_NS}*", timeout=timeout)
     if rc:
         return None
     heads = {}
@@ -1039,8 +1055,7 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
         return rec
     # kit 37: unlanded work goes to origin only when origin is known to be private. Read before anything changes, so a
     # public or unknown origin with nowhere private for the record refuses with the worktree exactly as it was.
-    vis = origin_visibility(primary)
-    dest = "origin" if vis == "private" else (private_backup_remote(primary) or None)
+    dest, vis = backup_destination(primary)
     withheld = vis != "private"  # the record of unlanded work stays off a public main too
     rec.update(origin_visibility=vis, tag_remote=("origin" if dest == "origin" else "private_backup_remote"
                                                   if dest else "local"), remote_durable=dest is not None)
