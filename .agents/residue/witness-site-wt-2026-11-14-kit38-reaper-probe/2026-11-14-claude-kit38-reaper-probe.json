@@ -1,0 +1,12 @@
+{
+  "id": "2026-11-14-claude-kit38-reaper-probe",
+  "provider": "claude",
+  "status": "active",
+  "branch": "agent/claude/2026-11-14-kit38-reaper-probe",
+  "worktree": "../witness-site-wt-2026-11-14-kit38-reaper-probe",
+  "base_commit": "8f48971",
+  "objective": "",
+  "owned_paths": [],
+  "started": "2026-11-14T16:22:39-05:00",
+  "handoff": ".agents/handoffs/2026-11-14-claude-kit38-reaper-probe.md"
+}
