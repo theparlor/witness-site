@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Parallel-session helper for this repo. Standard: .agents/SESSIONS.md. Stdlib only.
 
-  session start <task> [--own PATH]... [--provider P] [--objective TEXT] [--robot] [--here]
-  session status [--json] [--here]
-  session land [--title T] [--pr] [--no-merge] [--local] [--kf11-verdict yes|no --kf11-reviewer NAME] [--here]
+  session start <task> [--own PATH]... [--provider P] [--objective TEXT] [--robot] [--batch ID] [--here]
+  session capacity [--lanes N] [--json] [--here]
+  session status [--json] [--all] [--here]
+  session resume <task|branch|ref> [--as NAME] [--own PATH]... [--provider P] [--objective TEXT] [--here]
+  session land [--title T] [--pr] [--no-merge] [--local] [--kf11-verdict yes|no --kf11-reviewer NAME]
+               [--owners-decided TEXT] [--here]
   session finish [--task TASK] [--here]
   session retire [--reason TEXT] [--task TASK] [--dry-run] [--here]
   session wip-backup [--here]          (run by .agents/hooks/post-commit, in the background)
@@ -55,6 +58,23 @@ finish with nothing removed). `wip-backup` leaves its result in the worktree's g
 session's backup (current, behind, failing or none, with its age) and says when backups are off in the shell. `status`
 names a land stopped at a rebase conflict by its branch; the hourly reaper reports it as stuck and backs it up under the
 branch's own name too.
+Kit 39, two people in one repository: a backup push carries a lease and is refused when the remote ref holds another
+clone's commit; land, finish, retire and the reaper remove a backup only when its tip is this clone's work; `status`
+reads the remote ref and says "not checked" rather than "current" when it cannot; `start` refuses a task name another
+clone holds on origin; an optional person slug (`git config session.person`, SESSION_PERSON) goes into every name;
+a combined landing adds a Co-authored-by trailer for each other author (SESSIONS.md, kit 39).
+Kit 40: `start` claims the new branch's name on the remote (refs/claims/<branch>, a create-only push), so two clones
+that start one name before either has saved cannot both go on, and a start that dies after its claim is taken up again
+by its own clone; `status --all` lists every claimed or backed-up task on the remote with its holder, age and whether
+it is ahead of the base branch; `resume` continues another clone's unlanded task as a new attempt that cites it and
+never changes it; a land that conflicts with another person's landing is refused, names that landing, leaves the task
+record blocked and not complete, and waits for `land --owners-decided TEXT` (SESSIONS.md, kit 40).
+Kit 41, batch lanes: `start --batch ID` marks a lane a batch cuts for parallel width. It is cut only while the disk
+stays above the batch line (SESSION_BATCH_FREE_GB, default the 25 GB warning line) after this checkout, measured with
+each blob rounded up to a 4 KiB block; otherwise it is refused with exit 75, nothing created, which means queue it and
+start it once a running lane has landed and `finish` freed its checkout. SESSION_ALLOW_LOW_DISK never admits one. The
+room between the batch line and the floor is kept for the worktrees that land work. `capacity --lanes N` says how many
+of N lanes fit now (exit 0 when all do, 75 when some must queue; read-only).
 """
 import argparse, contextlib, datetime as dt, filecmp, fnmatch, importlib.util, io, json, os, re, shutil, signal, subprocess, sys, time
 from pathlib import Path
@@ -213,7 +233,8 @@ def witness_report(cmd, code, started):
             outcome = EVENT["outcome"]  # a verb that always exits 0 but knows better (wip-backup's failed push)
         elif code in (0, None):
             outcome = "ok"
-        elif code == 3 or EVENT["attrs"].get("reason") in ("wrong_repo", "low_disk", "kf11", *GUARD_REASONS):
+        elif code == 3 or EVENT["attrs"].get("reason") in ("wrong_repo", "low_disk", "batch_line", "kf11", "name_in_use",
+                                                          *GUARD_REASONS):
             outcome = "blocked"  # stopped for a person: a rebase conflict, a shell in the wrong repo, a full disk, KF-11
         elif cmd == "status" and code == 1:
             outcome = "ok"  # overlaps found: a finding, not a failure
@@ -730,7 +751,44 @@ def put_back(top, kept=(), stopped=False):
     return [rel for rel, _ in left]
 
 
-def rebase_on_base(top, base, branch):
+CONFLICT = {}  # what the last stopped rebase met: files, the other people's landings, and whether the land was refused
+
+
+def conflict_landings(top, mb, pin, files):
+    """The landings on the base since this branch left it (mb..pin) that changed the conflicted files, newest first:
+    each one's commit, author, date, subject and, for a local landing, the session branch it came from."""
+    if not (mb and files):
+        return []
+    out = git(top, "log", "--format=%H%x1f%an%x1f%ae%x1f%cI%x1f%s%x1f%b%x1e", f"{mb}..{pin}", "--", *files, check=False,
+              env=READ_ONLY)
+    rows = []
+    for rec in out.split("\x1e"):
+        parts = rec.strip("\n").split("\x1f")
+        if len(parts) < 6 or not parts[0].strip():
+            continue
+        m = LANDED_FROM.search(parts[5])
+        rows.append({"commit": parts[0].strip(), "author": parts[1], "email": parts[2], "date": parts[3],
+                     "subject": parts[4], "branch": m.group(1) if m else ""})
+    return rows
+
+
+def my_identity(top):
+    """(name, email) this clone commits as, from `git var GIT_AUTHOR_IDENT`; ("", "") when it cannot be read."""
+    m = re.match(r"(.*) <([^>]*)>", git(top, "var", "GIT_AUTHOR_IDENT", check=False))
+    return (m.group(1).strip(), m.group(2).strip().lower()) if m else ("", "")
+
+
+def someone_elses(rows, me):
+    """The landings whose author is not this clone's identity. A landing counts as this person's own when its author
+    email OR its author name equals this clone's: a pull request GitHub squash-merged carries the account's name with
+    the same email, or the same name with a noreply email, and one person's own sessions must keep the solo path."""
+    name, mail = me
+    if not (name or mail):
+        return []
+    return [r for r in rows if not ((mail and r["email"].lower() == mail) or (name and r["author"] == name))]
+
+
+def rebase_on_base(top, base, branch, decided=""):
     """Rebase the session branch onto origin/<base>, first skipping commits that already landed.
     Returns the commit it rebased onto (a sha, truthy), or reports the conflict and returns "" (the
     rebase stays open to resolve). Files the branch untracks are kept through it (keep_untracked); a
@@ -742,7 +800,9 @@ def rebase_on_base(top, base, branch):
     must build its squash on the commit this branch was rebased onto, never on whatever the shared ref
     names later (Cast e2bcc5811 and 466d01305, 2026-09-30, reverted two sessions' landings that way)."""
     skipped = ""
+    CONFLICT.clear()
     pin = git(top, "rev-parse", "--verify", f"origin/{base}^{{commit}}")
+    left_at = git(top, "merge-base", "HEAD", pin, check=False)
     b = landed_boundary(top, base, branch, up=pin)
     moving = b or run(["git", "merge-base", "--is-ancestor", pin, "HEAD"], top, check=False).returncode
     kept = keep_untracked(top, base, b[1] if b else None, up=pin) if moving else []
@@ -762,6 +822,35 @@ def rebase_on_base(top, base, branch):
     else:
         mb = ""
     files = git(top, "diff", "--name-only", "--diff-filter=U", check=False)
+    # Kit 40 (M27): a conflict with ANOTHER PERSON's landing is two owners' intents that cannot both hold, and no
+    # agent chooses between them. Until kit 39 the hint here told the stopped session to "resolve by meaning", the
+    # other person was not named, and the stopped task's record already read complete (the 2026-11-17 trial, P7).
+    conflicted = name_list(top, "--diff-filter=U", check=False)
+    me = my_identity(top)
+    theirs = someone_elses(conflict_landings(top, left_at, pin, conflicted), me)
+    if theirs:
+        named = "\n".join(f"  {r['author']} <{r['email']}> landed {r['commit'][:10]} on {r['date']}: {r['subject']!r}"
+                           + (f" (from {r['branch']})" if r["branch"] else "") for r in theirs[:5])
+        CONFLICT.update(files=conflicted, landings=theirs, refused=not decided,
+                        me=f"{me[0]} <{me[1]}>".strip())
+        owners = " and ".join(dict.fromkeys([me[0] or "this task's owner"] + [r["author"] for r in theirs]))
+        if decided:
+            print(f"REBASE CONFLICT with someone else's landing, on the same lines:\n{files}\n{named}\n\n"
+                  f"The owners' decision on record for this land: {decided!r}.\nApply that decision to these lines and "
+                  "nothing else. Then `git add <files>`, `git rebase --continue`, and run\n"
+                  "`python3 .agents/bin/session land` again with the same --owners-decided.")
+            put_back(top, kept, stopped=True)
+            return ""
+        run(["git", "rebase", "--abort"], top, check=False)
+        print(f"LAND REFUSED. This work and someone else's landing change the same lines:\n{files}\n{named}\n\n"
+              f"These are two owners' intents, and no agent chooses between them. The two owners decide: {owners} "
+              "(or whoever is authorized to decide for them).\nNothing was chosen and nothing was lost: the rebase was "
+              "undone, this branch and its commits are as they were, and the task stays unlanded.\nWhen the owners "
+              "have decided, land again with their decision on the record:\n"
+              "  python3 .agents/bin/session land --owners-decided \"<who decided, and what>\"\n"
+              "That land stops at the same lines with the rebase left open, to apply the decision and nothing else.")
+        put_back(top, kept)
+        return ""
     print("REBASE CONFLICT. Another session landed changes to the same lines:\n" + files)
     if skipped:
         print(f"(Not a replay of this branch's own landing: {skipped} and were skipped first.)")
@@ -796,10 +885,11 @@ def _env_gb(name, default):
     return float(v) if v else default
 
 
-def checkout_estimate(repo, ref):
+def checkout_estimate(repo, ref, block=1):
     """Bytes a checkout of `ref` writes: the sum of its blob sizes from `git ls-tree -r -l -z`, read as bytes so
     no file name can fail to decode. A gitlink (a submodule, size "-") is skipped; so is any other entry git
-    gives no size. An LFS file counts as its pointer, so this can read low for an LFS repository."""
+    gives no size. An LFS file counts as its pointer, so this can read low for an LFS repository.
+    block (kit 41): round each blob up to that allocation unit, which is what the disk really gives a file."""
     r = subprocess.run(["git", "ls-tree", "-r", "-l", "-z", ref], cwd=repo, capture_output=True,
                        env={**os.environ, **READ_ONLY})
     if r.returncode:
@@ -808,7 +898,7 @@ def checkout_estimate(repo, ref):
     for entry in r.stdout.split(b"\0"):
         meta = entry.partition(b"\t")[0].split()
         if len(meta) == 4 and meta[1] == b"blob" and meta[3] != b"-":
-            total += int(meta[3])
+            total += -(-int(meta[3]) // block) * block
     return total
 
 
@@ -864,17 +954,228 @@ def disk_guard(primary, where, ref, adopt):
           f"{remedy}", file=sys.stderr)
 
 
+# Batch lanes (kit 41). On 2026-11-18 a persona batch cut fourteen worktrees of one repository up front, and its
+# fetch step cut one more for every landing. Each start passed the floor on its own, but the repository's checkout
+# grew from 1.4 to 5 GB within a day as the batch's own pages landed, and the disk sat at 7 to 9 GB free for hours
+# (6.9 GB on 2026-11-19, ten such worktrees holding 44 GB). The floor judges one start; nothing judged the batch.
+# A batch lane is parallel width, not need, so it may only spend space above the batch line. The room between that
+# line and the floor stays for the worktrees that move work to landing (a fetch step's land worktree, a close) and
+# for swap, which lives on the same volume. A lane that does not fit is queued, not failed: exit QUEUED, nothing made.
+BLOCK = 4096  # the allocation unit: a 90,000-file checkout measured 5.0 GB on disk against 4.85 GB of blobs
+QUEUED = 75   # EX_TEMPFAIL: the lane waits in its batch's queue and is started once a running lane has finished
+
+
+def batch_line():
+    """GB a batch lane must leave free: SESSION_BATCH_FREE_GB, else the warning line (25 unless moved)."""
+    return _env_gb("SESSION_BATCH_FREE_GB", _env_gb("SESSION_WARN_FREE_GB", WARN_FREE_GB))
+
+
+def lane_room(primary, ref):
+    """(free bytes on the disk that holds this repository's sibling worktrees, bytes one more lane of `ref` takes)."""
+    return shutil.disk_usage(primary.parent).free, checkout_estimate(primary, ref, block=BLOCK)
+
+
+def batch_guard(primary, ref, batch):
+    """Queue (exit QUEUED, nothing created) or admit a batch lane before `start` cuts it from `ref`. Fail-open like
+    the floor: a measurement that errors prints one note, and the floor still judges the start. The Witness event
+    gets lane_gb, batch_line_gb and batch_guard (batch_admitted, batch_queued or batch_skipped), never the batch
+    name or a path."""
+    EVENT["attrs"]["batch"] = True
+    try:
+        line = batch_line()
+        free, lane = lane_room(primary, ref)
+    except Exception as e:
+        EVENT["attrs"]["batch_guard"] = "batch_skipped"
+        print(f"session: note: batch-line check skipped ({type(e).__name__}: {e}); the floor still applies",
+              file=sys.stderr)
+        return
+    after = (free - lane) / GB
+    EVENT["attrs"].update(lane_gb=round(lane / GB, 2), batch_line_gb=line)
+    if after >= line:
+        EVENT["attrs"]["batch_guard"] = "batch_admitted"
+        return
+    EVENT["attrs"].update(batch_guard="batch_queued", reason="batch_line")
+    print(f"session: batch {batch}: lane not cut, queue it (nothing was created): {free / GB:.1f} GB free, a lane of "
+          f"this repository takes about {lane / GB:.2f} GB, leaving {after:.1f} GB, under the {line:g} GB batch line "
+          f"(SESSION_BATCH_FREE_GB). A batch lane spends only the space above that line; the room under it is kept "
+          f"for landing work and for swap, and SESSION_ALLOW_LOW_DISK does not admit a batch lane. Start this lane "
+          f"once a running lane has landed and `python3 .agents/bin/session finish` has freed its checkout; "
+          f"`python3 .agents/bin/session capacity --lanes N` says how many fit now.", file=sys.stderr)
+    sys.exit(QUEUED)
+
+
+def cmd_capacity(a):
+    """How many more lanes of this repository fit above the batch line now (kit 41), so a batch cuts that many and
+    queues the rest. Read-only but for fetching the base branch, so the estimate is the tree a new lane would check
+    out. Exit 0 when all `--lanes` fit, QUEUED when some must wait, 1 when it could not measure: a planner is told
+    so, never handed a guess, and each `start --batch` is still judged as it is cut."""
+    _, primary, _ = here(a.here)
+    if a.lanes < 1:
+        sys.exit("session: capacity: --lanes must be 1 or more")
+    base = default_branch(primary)
+    git(primary, "fetch", "-q", "origin", base, check=False)  # offline: estimate the base branch this clone has
+    try:
+        line, floor = batch_line(), _env_gb("SESSION_MIN_FREE_GB", MIN_FREE_GB)
+        free, lane = lane_room(primary, f"origin/{base}")
+    except Exception as e:
+        print(f"session: capacity unmeasured ({type(e).__name__}: {e}); start lanes one at a time with --batch, each "
+              f"is judged as it is cut", file=sys.stderr)
+        return 1
+    fits = a.lanes if lane <= 0 else max(0, int((free - line * GB) // lane))
+    start = min(fits, a.lanes)
+    queue = a.lanes - start
+    EVENT["attrs"].update(free_gb=round(free / GB, 2), lane_gb=round(lane / GB, 2), batch_line_gb=line,
+                          lanes=a.lanes, fits=fits, queue=queue)
+    if a.json:
+        print(json.dumps({"free_gb": round(free / GB, 2), "lane_gb": round(lane / GB, 2), "batch_line_gb": line,
+                          "floor_gb": floor, "fits": fits, "lanes": a.lanes, "start": start, "queue": queue}))
+    else:
+        print(f"capacity: {free / GB:.1f} GB free; a lane of this repository takes about {lane / GB:.2f} GB; the batch "
+              f"line is {line:g} GB (SESSION_BATCH_FREE_GB). Room for {fits} lane(s) now: start {start} of "
+              f"{a.lanes}, queue {queue}.")
+        if queue:
+            print("Start a queued lane once a running one has landed and `python3 .agents/bin/session finish` has "
+                  "freed its checkout, then ask again.")
+    EVENT["outcome"] = "ok"  # a count, not a failure, whichever way it comes out
+    return QUEUED if queue else 0
+
+
+ALLOW_NAME = "SESSION_ALLOW_NAME_IN_USE"
+
+
+def name_in_use_check(primary, base, branch, tid, task):
+    """Kit 39: refuse a task name someone else already uses, before anything is created. On origin, a branch or a
+    backup ref of this branch's name, or this task's record on origin/<base>, that this clone did not make (its
+    own-work log, its local branch and reflog) means another clone holds the name: two clones on one name share one
+    branch, one task record and one backup ref, and their lands collide (the 2026-11-17 two-person trial, P1). The
+    refusal names the holder and its age. The same clone restarting its own task passes. Fail-open: an origin that
+    cannot be asked prints one note and the start goes on. SESSION_ALLOW_NAME_IN_USE=1 starts anyway, once."""
+    if os.environ.get(ALLOW_NAME, "").strip() == "1":
+        EVENT["attrs"]["bypass"] = "name_in_use"
+        return
+    try:
+        rt = load_retirement()
+        if rt.own_started(primary, branch):
+            return
+        r = run(["git", "ls-remote", "origin", f"refs/heads/{branch}", rt.wip_ref(branch)], primary, check=False,
+                env=wip_env())
+        if r.returncode:
+            print("session: note: origin could not be asked whether this task name is in use; starting without that "
+                  "check", file=sys.stderr)
+            return
+        found = []
+        for line in r.stdout.splitlines():
+            sha, _, ref = line.partition("\t")
+            if not sha or rt.sha_owned(primary, ref, sha, branch):
+                continue
+            if not rt.has_commit(primary, sha):
+                rt.fetch_tip(primary, ref, env=wip_env())
+            who, when = rt.tip_owner(primary, sha)
+            found.append(f"{ref} (tip {sha[:10]} by {who}, {rt.age_text(when)})")
+        rel = f".agents/tasks/{tid}.json"
+        blob = run(["git", "show", f"origin/{base}:{rel}"], primary, check=False, env=READ_ONLY)
+        if blob.returncode == 0:
+            try:
+                rec = json.loads(blob.stdout)
+            except ValueError:
+                rec = {}
+            log = git(primary, "log", "-1", "--format=%an%x1f%cI", f"origin/{base}", "--", rel, check=False,
+                      env=READ_ONLY).split("\x1f")
+            who = log[0] if log and log[0] else "an unknown author"
+            when = rec.get("started") if isinstance(rec, dict) and rec.get("started") else (log[1] if len(log) > 1 else "")
+            found.append(f"the task record {rel} on origin/{base} (committed by {who}, task {rt.age_text(when)})")
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - the check never stops a start it could not run
+        print(f"session: note: the task-name check could not run ({type(e).__name__}); starting without it", file=sys.stderr)
+        return
+    if found:
+        EVENT["attrs"]["reason"] = "name_in_use"
+        sys.exit(f"session: refused: the task name {task!r} is already in use on origin, and this clone did not start "
+                 f"it: {'; '.join(found)}. Nothing was created.\n  Two clones on one name share one branch, one task "
+                 f"record and one backup ref, and their lands collide. Pick another task name"
+                 f"{NAME_HINT}.\n  If the name is yours from another clone and you mean to reuse it, once: "
+                 f"{ALLOW_NAME}=1 python3 .agents/bin/session start {task} ...")
+
+
+def claim_at_start(primary, branch, tid, task, person):
+    """Kit 40: claim the new branch's name on the remote before anything is created, so two clones that start one name
+    before either has saved cannot both go on (retirement.claim_name: a create-only push of a small claim commit to
+    refs/claims/<branch>; the remote takes exactly one). The loser is refused and told the holder and the claim's age.
+    Returns the remote the claim was made on, or "" when this call made none. A claim this clone already holds (an
+    earlier start of the name, or one that died after its claim) passes. Fail-open like the kit 39 check: a remote
+    that cannot be asked, or an origin that takes no unlanded work (kit 37) with no private backup remote, prints at
+    most one note and the start goes on. SESSION_ALLOW_NAME_IN_USE=1 makes no claim and steps past another's, once."""
+    if os.environ.get(ALLOW_NAME, "").strip() == "1":
+        return ""
+    try:
+        rt = load_retirement()
+        remote, vis = rt.backup_destination(primary)
+        if remote is None:
+            # kit 37's gate: nothing unlanded, a task's name included, goes to an origin that is public or unknown
+            EVENT["attrs"].update(claim="kept_local", origin_visibility=vis)
+            if vis != "public":
+                print(f"session: note: the task name was not claimed: origin's visibility is {vis} just now and no "
+                      "private backup remote is named; starting without a claim", file=sys.stderr)
+            return ""
+        result, detail = rt.claim_name(primary, branch, tid, person, remote=remote, env=wip_env())
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - the claim never stops a start it could not run
+        print(f"session: note: the task name could not be claimed ({type(e).__name__}); starting without a claim", file=sys.stderr)
+        return ""
+    EVENT["attrs"]["claim"] = result
+    if result == "held":
+        EVENT["attrs"]["reason"] = "name_in_use"
+        sys.exit(f"session: refused: the task name {task!r} is already in use, and this clone did not claim it: {detail}. "
+                 f"Nothing was created.\n  Another clone started this name first; the remote takes one claim per name. "
+                 f"Pick another task name{NAME_HINT}; `python3 .agents/bin/session status --all` lists what other clones hold, and `session resume` continues another clone's saved work as a new attempt.\n  A claim whose start died is taken up again when its own clone "
+                 f"starts the name again. To step past a claim that will never be used, once: "
+                 f"{ALLOW_NAME}=1 python3 .agents/bin/session start {task} ...")
+    if result == "unasked":
+        print(f"session: note: the task name was not claimed on {remote} ({detail}); starting without a claim", file=sys.stderr)
+    return remote if result == "claimed" else ""
+
+
+def release_claim(primary, branch, remote):
+    """Remove the claim this run just made, when the start it was made for did not go on. Fail-open."""
+    try:
+        load_retirement().drop_claim(primary, branch, remote=remote, env=wip_env())
+    except (Exception, SystemExit):
+        pass
+
+
+PERSON_ENV, PERSON_KEY = "SESSION_PERSON", "session.person"
+PERSON_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+NAME_HINT = (f", or set a person for this clone (`git config {PERSON_KEY} <slug>`, or {PERSON_ENV}=<slug> for one "
+             "command) so each person's names differ")
+
+
+def person_slug(repo):
+    """Kit 39: the short person slug this clone's names carry, or "" when none is set (then every name is kit 38's).
+    SESSION_PERSON for one command, else `git config session.person` (repo-local or global). Lowercase letters,
+    digits and hyphens, at most 32; anything else refuses before a name is made. With a slug, the branch is
+    agent/<provider>/<person>/<date>-<task>, the task id <date>-<provider>-<task>@<person>, the worktree
+    <repo>-wt-<date>-<task>@<person>, and the backup ref refs/wip/<that branch>. Every parser of these names reads the
+    task from the branch's last segment and drops an @<person> suffix, so both shapes are read alike."""
+    v = (os.environ.get(PERSON_ENV) or "").strip() or git(repo, "config", "--get", PERSON_KEY, check=False).strip()
+    if v and not PERSON_SLUG.match(v):
+        sys.exit(f"session: the person slug {v!r} ({PERSON_ENV} or git config {PERSON_KEY}) must be lowercase "
+                 "letters, digits and hyphens, at most 32, starting with a letter or digit; nothing was created")
+    return v
+
+
 def cmd_start(a):
     top, primary, linked = here(a.here)
     EVENT["attrs"].update(adopt=bool(a.here), linked=linked)
     if not SLUG.match(a.task):
         sys.exit("session: task must be a short slug of letters, digits, dot, dash, underscore")
+    if a.batch is not None and not SLUG.match(a.batch):
+        sys.exit("session: --batch must be a short slug of letters, digits, dot, dash, underscore")
     today = dt.date.today().isoformat()
     provider = a.provider or os.environ.get("SESSION_PROVIDER") or "claude"
     base = default_branch(primary)
     git(primary, "fetch", "-q", "origin", base)
     name = a.task if a.task.startswith(today) else f"{today}-{a.task}"
-    tid = f"{today}-{provider}-{a.task.removeprefix(today + '-')}"
+    person = person_slug(primary)  # kit 39: "" unless a person is set, and then every name below is kit 38's
+    tid = f"{today}-{provider}-{a.task.removeprefix(today + '-')}" + (f"@{person}" if person else "")
+    EVENT["attrs"]["person_set"] = bool(person)
     if a.here:
         # Adopt the worktree we are standing in, normally the Claude desktop app's
         # <repo>/.claude/worktrees/<name>: no second worktree, no new branch, only the task file
@@ -892,15 +1193,28 @@ def cmd_start(a):
         base_commit = git(top, "rev-parse", "--short", git(top, "merge-base", f"origin/{base}", "HEAD"))
         disk_guard(primary, top, None, adopt=True)
     else:
-        branch = f"agent/{provider}/{name}"
-        wt = primary.parent / f"{primary.name}-wt-{name}"
+        branch = f"agent/{provider}/{person}/{name}" if person else f"agent/{provider}/{name}"
+        wt = primary.parent / (f"{primary.name}-wt-{name}@{person}" if person else f"{primary.name}-wt-{name}")
         if wt.exists():
             sys.exit(f"session: {wt} already exists; pick another task name or `cd` there")
+        name_in_use_check(primary, base, branch, tid, a.task)  # kit 39: before anything is created
         base_commit = git(primary, "rev-parse", "--short", f"origin/{base}")
+        if a.batch:
+            batch_guard(primary, f"origin/{base}", a.batch)  # kit 41: a batch lane is queued above the floor
         disk_guard(primary, wt.parent, f"origin/{base}", adopt=False)
-        git(primary, "worktree", "add", "-q", "-b", branch, str(wt), f"origin/{base}")
+        claimed = claim_at_start(primary, branch, tid, a.task, person)  # kit 40: the last step before anything is created
+        try:
+            git(primary, "worktree", "add", "-q", "-b", branch, str(wt), f"origin/{base}")
+        except SystemExit:
+            if claimed:
+                release_claim(primary, branch, claimed)
+            raise
     activate_prepush(primary)
     write_pin(wt, branch, tid, session_id())  # the commit guard holds this worktree to this branch and session (kit 28)
+    try:  # kit 39: this clone's own-work log, so a later start of the same name here is known as this clone's
+        load_retirement().own_note(primary, "start", branch=branch, task=tid)
+    except (Exception, SystemExit):
+        pass
     rel = os.path.relpath(wt, primary)
     (wt / ".agents" / "tasks").mkdir(parents=True, exist_ok=True)
     (wt / ".agents" / "handoffs").mkdir(parents=True, exist_ok=True)
@@ -910,6 +1224,10 @@ def cmd_start(a):
             "handoff": f".agents/handoffs/{tid}.md"}
     if a.robot:  # a scheduled job's run: the reaper retires it once a later run supersedes it (kit 29)
         task["robot"] = True
+    if a.batch:  # kit 41: the batch this lane belongs to, written only when given
+        task["batch"] = a.batch
+    if person:  # kit 39: written only when set, so a solo record is byte for byte kit 38's
+        task["person"] = person
     (wt / ".agents" / "tasks" / f"{tid}.json").write_text(json.dumps(task, indent=2) + "\n")
     tmpl = wt / ".agents" / "HANDOFF.template.md"
     body = tmpl.read_text() if tmpl.exists() else "# Agent handoff: <task>\n"
@@ -932,6 +1250,145 @@ def cmd_start(a):
     others = [s for s in sessions(primary) if s["path"] != str(wt)]
     if others:
         print(f"\n{len(others)} other live session(s) on this repo; run `python3 .agents/bin/session status` to see them.")
+
+
+RESUME_SUFFIX = "-cont"
+
+
+def cmd_resume(a):
+    """Kit 40 (M24, M26): continue another clone's unlanded task as a NEW attempt under this clone's own name.
+
+    The task is found on the remote (the same one read `status --all` makes) by its backup ref, its branch, its task
+    id or its bare task name. The new attempt gets its own branch (cut from the earlier attempt's backed-up tip, so
+    the earlier commits are in it unchanged, with their authors), its own worktree, claim and backup ref, and a task
+    record and handoff that cite the attempt they continue: its task id, branch, ref, the commit read and the holder.
+    Nothing of the earlier attempt is rewritten or removed: its refs are only read, and its owner's later commits keep
+    going to its own ref. The earlier attempt's own task record and handoff file are taken out of the NEW branch in
+    the resume commit (the record would otherwise land as a second live owner of the same paths); they stay in the
+    earlier attempt's commits and on its ref, and the handoff's text is quoted in the new handoff, so the resumer
+    never has to ask the first owner what was going on. No contact with the earlier owner is needed, and no person
+    need be set. The new task name is <task>-cont unless --as names another."""
+    _, primary, _ = here(a.here)
+    today = dt.date.today().isoformat()
+    provider = a.provider or os.environ.get("SESSION_PROVIDER") or "claude"
+    base = default_branch(primary)
+    git(primary, "fetch", "-q", "origin", base)
+    rem = remote_work(primary, base)
+    if not rem["checked"]:
+        sys.exit(f"session: resume reads the task from {rem['remote']}, which could not be asked"
+                 + (f" ({rem['error']})" if rem.get("error") else "") + "; nothing was created")
+
+    def short(name):
+        return re.sub(r"^\d{4}-\d{2}-\d{2}-", "", name.rsplit("/", 1)[-1])
+
+    want = a.task
+    cands = [t for t in rem["tasks"] if want in (t["name"], t["ref"], t["claim_ref"], t["task"],
+                                                 t["name"].rsplit("/", 1)[-1], short(t["name"]))]
+    if len(cands) != 1:
+        listed = "; ".join(f"{t['name']} ({t['holder']})" for t in cands) or "none"
+        sys.exit(f"session: resume: {want!r} matched {len(cands)} task(s) on {rem['remote']}: {listed}. Name one by its "
+                 "branch or backup ref, as `python3 .agents/bin/session status --all` lists them; nothing was created")
+    t = cands[0]
+    who = t["holder"] + (f" (person {t['person']})" if t.get("person") else "")
+    if t["state"] == "claimed":
+        sys.exit(f"session: resume: {t['name']} is claimed by {who} and has nothing saved on {rem['remote']}, so there is "
+                 "nothing to continue; start a task of your own under another name. Nothing was created")
+    if not t["ahead"]:
+        sys.exit(f"session: resume: {t['name']} has nothing ahead of {base} (it landed, or holds no commit yet), so "
+                 "there is nothing to continue; nothing was created")
+    live = f"branch refs/heads/{t['name']}" in git(primary, "worktree", "list", "--porcelain", env=READ_ONLY).splitlines()
+    if t.get("mine") and live:
+        sys.exit(f"session: resume: {t['name']} is this clone's own live session; work in its worktree "
+                 "(`python3 .agents/bin/session status` names it). Nothing was created")
+    tip = t["tip"]
+    task = a.as_name or short(t["name"]) + RESUME_SUFFIX
+    if not SLUG.match(task):
+        sys.exit("session: the new task name must be a short slug of letters, digits, dot, dash, underscore")
+    name = task if task.startswith(today) else f"{today}-{task}"
+    person = person_slug(primary)
+    tid = f"{today}-{provider}-{task.removeprefix(today + '-')}" + (f"@{person}" if person else "")
+    branch = f"agent/{provider}/{person}/{name}" if person else f"agent/{provider}/{name}"
+    wt = primary.parent / (f"{primary.name}-wt-{name}@{person}" if person else f"{primary.name}-wt-{name}")
+    EVENT["attrs"].update(person_set=bool(person), resumed_own=bool(t.get("mine")))
+    if wt.exists():
+        sys.exit(f"session: {wt} already exists; pick another name with --as")
+    if branch == t["name"]:
+        sys.exit("session: resume makes a new attempt under a name of its own, and that is the earlier attempt's "
+                 "branch; pick another name with --as. Nothing was created")
+    name_in_use_check(primary, base, branch, tid, task)
+    disk_guard(primary, wt.parent, tip, adopt=False)
+    claimed = claim_at_start(primary, branch, tid, task, person)
+    try:
+        git(primary, "worktree", "add", "-q", "-b", branch, str(wt), tip)
+    except SystemExit:
+        if claimed:
+            release_claim(primary, branch, claimed)
+        raise
+    activate_prepush(primary)
+    write_pin(wt, branch, tid, session_id())
+    try:
+        load_retirement().own_note(primary, "start", branch=branch, task=tid, continues=t["name"])
+    except (Exception, SystemExit):
+        pass
+    changed = name_list(primary, "--no-renames", f"origin/{base}...{tip}", check=False, env=READ_ONLY)
+    was_rel, was = record_at(primary, tip, t["name"], changed)
+    was_handoff = was.get("handoff") or ""
+    earlier_text = (wt / was_handoff).read_text() if was_handoff and (wt / was_handoff).is_file() else ""
+    rel = os.path.relpath(wt, primary)
+    base_commit = git(primary, "rev-parse", "--short", git(primary, "merge-base", f"origin/{base}", tip))
+    now = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+    own = a.own or was.get("owned_paths") or []
+    objective = a.objective or was.get("objective") or ""
+    rec = {"id": tid, "provider": provider, "status": "active", "branch": branch, "worktree": rel,
+           "base_commit": base_commit, "objective": objective, "owned_paths": own, "started": now,
+           "handoff": f".agents/handoffs/{tid}.md",
+           "continues": {"task": was.get("id") or t["task"], "branch": t["name"], "ref": t["ref"], "commit": tip,
+                         "holder": t["holder"], "holder_email": t.get("holder_email", ""),
+                         "person": t.get("person", ""), "checkpoint_date": t["date"], "resumed": now}}
+    if person:
+        rec["person"] = person
+    staged = []
+    for gone in (was_rel, was_handoff):  # the earlier attempt's own record and handoff: out of the NEW branch only
+        if gone and (wt / gone).is_file():
+            (wt / gone).unlink()
+            staged.append(gone)
+    (wt / ".agents" / "tasks").mkdir(parents=True, exist_ok=True)
+    (wt / ".agents" / "handoffs").mkdir(parents=True, exist_ok=True)
+    (wt / ".agents" / "tasks" / f"{tid}.json").write_text(json.dumps(rec, indent=2) + "\n")
+    tmpl = wt / ".agents" / "HANDOFF.template.md"
+    body = tmpl.read_text() if tmpl.exists() else "# Agent handoff: <task>\n"
+    fill = {"# Agent handoff: <task>": f"# Agent handoff: {task}",
+            "- Status: planned | active | review-ready | blocked | complete": "- Status: active",
+            "- Provider/agent:": f"- Provider/agent: {provider}",
+            "- Objective:": f"- Objective: {objective}",
+            "- Worktree and branch:": f"- Worktree and branch: `{rel}`, `{branch}`",
+            "- Base and head commits:": f"- Base and head commits: base `{base_commit}`; head recorded at merge.",
+            "- Owned paths:": "- Owned paths: " + ", ".join(f"`{x}`" for x in own)}
+    for k, v in fill.items():
+        body = body.replace(k, v, 1)
+    body = body.rstrip("\n") + (
+        f"\n\n## Continues an earlier attempt\n\nThis task is a new attempt that continues `{rec['continues']['task'] or t['name']}` "
+        f"(branch `{t['name']}`), read from `{t['ref']}` at commit `{tip[:12]}` by {who}, dated {t['date']}. The "
+        "earlier attempt is unchanged by this one: its ref, its commits and their authors stay as they are, and "
+        "anything it produces later stays on its own ref until its owner and this one agree what lands.\n")
+    if earlier_text:
+        body += ("\nThe earlier attempt's handoff as of that commit, quoted:\n\n"
+                 + "\n".join(("> " + l).rstrip() for l in earlier_text.splitlines()) + "\n")
+    (wt / ".agents" / "handoffs" / f"{tid}.md").write_text(body)
+    staged += [f".agents/tasks/{tid}.json", f".agents/handoffs/{tid}.md"]
+    git(wt, "add", "--", *staged)
+    commit(wt, provider, "-q", "-m", f"session: resume {rec['continues']['task'] or t['name']} as {tid}\n\n"
+           f"A new attempt that continues {t['name']} from {t['ref']} at {tip[:12]} (by {t['holder']}). The earlier "
+           "attempt's ref and commits are untouched.")
+    EVENT["attrs"]["resumed_ahead"] = t["ahead"]
+    print(f"worktree: {wt}\nbranch:   {branch}\ntask:     {tid}\n")
+    print(f"A new attempt, continuing {t['name']} at {tip[:10]} by {who}, {load_retirement().age_text(t['date'])}"
+          + (" (a snapshot that includes uncommitted files)" if t.get("snapshot") else "") + ".\n"
+          f"Its {t['ahead']} commit(s) are in this branch with their authors. The earlier attempt is untouched: its ref "
+          f"{t['ref']} stays its owner's.\nWork only under {wt}. Commit there (specific files), then run:\n"
+          "  python3 .agents/bin/session land")
+    print(f"Repos whose pre-commit checks ownership want: export AGENT_NAME={provider}")
+    return 0
 
 
 def name_list(cwd, *a, check=True, env=None):
@@ -986,7 +1443,9 @@ def sessions(primary):
         res.append({"path": str(p), "branch": br, "task": task.get("id", ""), "status": task.get("status", ""),
                     "objective": task.get("objective", ""), "owned_paths": task.get("owned_paths", []),
                     "changed": changed, "uncommitted": len(dirty),
-                    "behind": int(counts[0]) if counts else 0, "ahead": int(counts[1]) if len(counts) > 1 else 0})
+                    "behind": int(counts[0]) if counts else 0, "ahead": int(counts[1]) if len(counts) > 1 else 0,
+                    **({"land_refused": task["land_refused"]} if task.get("status") == "blocked"
+                       and isinstance(task.get("land_refused"), dict) else {})})
     return res
 
 
@@ -1017,7 +1476,16 @@ def backup_line(b):
                  if "uncommitted kept local" in (b.get("detail") or "") else "")
         where = "the private backup remote" if b.get("result") == "pushed-private" or \
             "on the private backup remote" in (b.get("detail") or "") else "origin"
-        return f"backup: current on {where} ({b.get('ref') or 'refs/wip'}), {age}" + (f", by {who}" if who else "") + local
+        return (f"backup: current on {where} ({b.get('ref') or 'refs/wip'}), {age}" + (f", by {who}" if who else "")
+                + (", checked on the remote just now" if b.get("checked") else "") + local)
+    if b["state"] == "not-checked":  # kit 39
+        return (f"backup: NOT CHECKED: the remote could not be asked in this call, so nothing here proves a copy is "
+                f"there now; the record on this machine says {age}")
+    if b["state"] == "missing":
+        return (f"backup: MISSING: {b.get('ref') or 'refs/wip'} is not on the remote although a copy was recorded "
+                f"({age}); this work is on this machine only")
+    if b["state"] == "overwritten":
+        return f"backup: OVERWRITTEN: {b.get('detail') or 'the remote ref holds a commit this clone did not write'}; this work is on this machine only"
     if b["state"] == "failing":
         since = f" for {span(b['failing_h'])}" if b.get("failing_h") is not None else ""
         why = f" ({b['result']}: {b['detail'][:120]})" if b.get("detail") else f" ({b['result']})"
@@ -1032,6 +1500,48 @@ def backup_line(b):
     return "backup: none recorded on this machine yet"
 
 
+def remote_reading(rt, s, p, gd, head, remote, heads):
+    """Kit 39: the backup reading is judged against the remote ref read in this call, never only the local record,
+    which kept saying "current" after another clone's push had replaced the ref (the 2026-11-17 two-person trial).
+    current: the remote ref holds HEAD (or this clone's snapshot on top of it, or HEAD is on an origin branch);
+    not-checked: the remote could not be asked in this call; missing: the ref is not on the remote although a good copy
+    was recorded; overwritten: the ref holds a commit this clone did not write; behind: an older commit of this clone.
+    A reading of "local" (kit 37: nothing is pushed for this origin) is left as it is."""
+    b = s.get("backup") or {}
+    if b.get("state") == "local" or not head:
+        return
+    name = s.get("stopped_land") or (s["branch"] if s.get("branch") and s["branch"] != "(detached)" else "")
+    if not name:
+        return
+    ref = rt.WIP_NS + name
+    b["checked"], b["ref"] = heads is not None, b.get("ref") or ref
+    if heads is None:
+        if b.get("state") == "current":
+            b["state"] = "not-checked"
+        return
+    have = heads.get(name, "")
+    b["remote_tip"] = have
+    if have == head:
+        b["state"] = "current"
+        return
+    if have:
+        line = git(p, "log", "-1", "--format=%P", have, check=False, env=READ_ONLY).split()
+        if line and line[0] == head and rt.own_pushed(p, ref, have, (gd,)):
+            b["state"] = "current"  # this clone's snapshot of HEAD plus its uncommitted files
+        elif rt.sha_owned(p, ref, have, name, (head,), (gd,)):
+            b["state"] = "behind"
+        else:
+            if not rt.has_commit(p, have):
+                rt.fetch_tip(p, ref, remote)
+            b["state"], b["detail"] = "overwritten", rt.foreign_text(p, ref, have, remote)
+        return
+    if git(p, "branch", "-r", "--contains", head, check=False, env=READ_ONLY):
+        if b.get("state") != "none":
+            b["state"] = "current"  # nothing unlanded: HEAD is on an origin branch
+    elif b.get("state") in ("current", "behind") and b.get("age_h") is not None:
+        b["state"] = "missing"
+
+
 def backup_readings(ss):
     """Add each session's backup reading and stopped land to the status records (kit 35). Fail-open: a kit without
     retirement.py, or a reading that raises, leaves the session as it was and says nothing."""
@@ -1039,6 +1549,13 @@ def backup_readings(ss):
         rt = load_retirement()
     except (Exception, SystemExit):
         return
+    heads, remote = None, None
+    try:  # kit 39: one read of the backup refs on the destination per call; None when it cannot be asked
+        if ss:
+            remote, _ = rt.backup_destination(Path(ss[0]["path"]))
+            heads = rt.wip_heads(Path(ss[0]["path"]), remote=remote) if remote else None
+    except Exception:  # noqa: BLE001 - fail-open: the reading then says "not checked"
+        heads = None
     for s in ss:
         try:
             p = Path(s["path"])
@@ -1048,9 +1565,144 @@ def backup_readings(ss):
             s["stopped_land"] = rt.stopped_rebase_branch(gd) if gd else ""
         except Exception:
             continue
-    for k in ("current", "behind", "failing", "local", "none"):
-        EVENT["attrs"][f"backup_{k}"] = sum(1 for s in ss if (s.get("backup") or {}).get("state") == k)
+        try:
+            remote_reading(rt, s, p, gd, head, remote, heads)
+        except Exception:  # noqa: BLE001 - a reading that could not be checked never says "current"
+            if (s.get("backup") or {}).get("state") == "current":
+                s["backup"]["state"] = "not-checked"
+    for k in ("current", "behind", "failing", "local", "none", "not-checked", "missing", "overwritten"):
+        EVENT["attrs"][f"backup_{k.replace('-', '_')}"] = sum(1 for s in ss if (s.get("backup") or {}).get("state") == k)
     EVENT["attrs"]["stopped_lands"] = sum(1 for s in ss if s.get("stopped_land"))
+
+
+SEEN_NS = "refs/session-seen/"  # this clone's read-only copy of the remote's hidden refs (kit 40): never pushed
+
+
+def remote_work(primary, base):
+    """Kit 40 (M23): every task the remote holds as a claim (refs/claims/) or a backup (refs/wip/), whoever wrote it:
+    its holder (the author of the backup's tip, or of the claim; the person slug when the task record, the claim or the
+    branch name carries one), its age, and whether it is ahead of the base branch. Before this the only way to see
+    another clone's open work was `git ls-remote origin 'refs/wip/*'` by hand (the 2026-11-17 two-person trial, P3).
+
+    Read-only: one fetch of the hidden refs into refs/session-seen/ in this clone (objects and a local copy of the ref
+    names, pruned to what the remote holds now), then local reads. Nothing is pushed, no branch or worktree changes,
+    and no person need be set. Returns {"checked": False, ...} when the remote cannot be asked: nothing is then said
+    about what others hold. The names are the commits' own git config identities: supplied, not verified."""
+    out = {"checked": False, "remote": "origin", "tasks": []}
+    try:
+        rt = load_retirement()
+        remote = rt.backup_destination(primary)[0] or "origin"
+        out["remote"] = remote
+        f = run(["git", "fetch", "-q", "--prune", "--no-write-fetch-head", remote, f"+{rt.WIP_NS}*:{SEEN_NS}wip/*",
+                 f"+{rt.CLAIM_NS}*:{SEEN_NS}claims/*"], primary, check=False, env=wip_env())
+        if f.returncode:
+            out["error"] = " ".join((f.stderr or f.stdout).split())[:200]
+            return out
+        seen = {"wip": {}, "claims": {}}
+        fmt = "%(refname)%1f%(objectname)%1f%(authorname)%1f%(authoremail)%1f%(committerdate:iso-strict)%1f%(subject)"
+        for line in git(primary, "for-each-ref", f"--format={fmt}", SEEN_NS, check=False, env=READ_ONLY).splitlines():
+            ref, sha, who, mail, when, subject = (line.split("\x1f") + [""] * 6)[:6]
+            kind, _, name = ref[len(SEEN_NS):].partition("/")
+            if kind in seen and name:
+                seen[kind][name] = {"sha": sha, "who": who or "an unknown author", "mail": mail.strip("<>"), "when": when, "subject": subject}
+        for name in sorted(set(seen["wip"]) | set(seen["claims"])):
+            w, c = seen["wip"].get(name), seen["claims"].get(name)
+            info = rt.claim_info(primary, c["sha"]) if c else {}
+            t = {"name": name, "state": "backed-up" if w else "claimed", "ref": rt.WIP_NS + name if w else "",
+                 "claim_ref": rt.CLAIM_NS + name if c else "", "tip": (w or c)["sha"], "holder": (w or c)["who"],
+                 "holder_email": (w or c)["mail"], "date": (w or c)["when"], "task": info.get("task", ""),
+                 "person": info.get("person", ""), "objective": "", "ahead": 0, "behind": 0, "files": 0,
+                 "snapshot": bool(w and w["subject"].startswith("wip snapshot"))}
+            try:
+                t["age_s"] = max(0, round(time.time() - dt.datetime.fromisoformat(t["date"]).timestamp()))
+            except (TypeError, ValueError):
+                t["age_s"] = None
+            if w:
+                counts = git(primary, "rev-list", "--left-right", "--count", f"origin/{base}...{w['sha']}", check=False,
+                             env=READ_ONLY).split()
+                if len(counts) == 2:
+                    t["behind"], t["ahead"] = int(counts[0]), int(counts[1])
+                changed = name_list(primary, "--no-renames", f"origin/{base}...{w['sha']}", check=False, env=READ_ONLY)
+                t["files"] = sum(1 for x in changed if not x.startswith((".agents/tasks/", ".agents/handoffs/")))
+                _, rec = record_at(primary, w["sha"], name, changed)
+                if rec:
+                    t.update(task=rec.get("id") or t["task"], person=rec.get("person") or t["person"],
+                             objective=rec.get("objective") or "", task_status=rec.get("status") or "")
+                    if isinstance(rec.get("continues"), dict):
+                        t["continues"] = rec["continues"].get("branch") or rec["continues"].get("task") or ""
+                    if rec.get("status") == "blocked" and isinstance(rec.get("land_refused"), dict):
+                        t["land_refused"] = rec["land_refused"]
+                t["mine"] = bool(rt.sha_owned(primary, rt.WIP_NS + name, w["sha"], name))
+            else:
+                t["mine"] = bool(rt.own_claimed(primary, rt.CLAIM_NS + name, c["sha"]))
+            parts = name.split("/")
+            if not t["person"] and len(parts) == 4 and parts[0] == "agent":
+                t["person"] = parts[2]  # agent/<provider>/<person>/<date>-<task> (kit 39)
+            out["tasks"].append(t)
+        out["checked"] = True
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - a view that cannot be read says so, and status goes on
+        out["error"] = f"{type(e).__name__}: {e}"[:200]
+    EVENT["attrs"].update(remote_checked=out["checked"], remote_tasks=len(out["tasks"]),
+                          remote_others=sum(1 for t in out["tasks"] if not t.get("mine")))
+    return out
+
+
+def record_at(primary, sha, name, changed):
+    """(path, record) of the task record that names branch `name` in commit `sha`, among the paths that commit
+    changes against the base (`changed`); ("", {}) when it carries none (a record is committed with the first
+    commit that adds it, by a snapshot, or by land)."""
+    for rel in (x for x in changed if x.startswith(".agents/tasks/") and x.endswith(".json")):
+        try:
+            rec = json.loads(git(primary, "show", f"{sha}:{rel}", check=False, env=READ_ONLY))
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("branch") == name:
+            return rel, rec
+    return "", {}
+
+
+def refused_line(lr):
+    """One line on a land refused against someone else's landing (kit 40), from the task record's land_refused."""
+    who = "; ".join(f"{x.get('commit', '')[:10]} by {x.get('author', 'an unknown author')}" for x in lr.get("landings") or [])
+    return (f"LAND REFUSED {lr.get('at', '')}: it changes the same lines as {who or 'another landing'} "
+            f"({', '.join((lr.get('files') or [])[:5])}). The two owners decide; no agent chooses. Then: "
+            "`session land --owners-decided \"<who decided, and what>\"`")
+
+
+def remote_lines(rem, base):
+    """The remote view of `status --all` as text: other clones' open work first, then this clone's own."""
+    if not rem["checked"]:
+        return [f"\nremote: NOT CHECKED: {rem['remote']} could not be asked in this call"
+                + (f" ({rem['error']})" if rem.get("error") else "") + ", so nothing here says what other clones hold"]
+    rt = load_retirement()
+    others = [t for t in rem["tasks"] if not t.get("mine")]
+    mine = [t for t in rem["tasks"] if t.get("mine")]
+    L = [f"\nremote: open work on {rem['remote']}, read just now: {len(others)} from other clone(s), {len(mine)} from this "
+         "clone. A holder is the name on the commit: supplied, not verified"]
+    for label, rows in (("other clones", others), ("this clone", mine)):
+        if rows:
+            L.append(f"\n{label}:")
+        for t in rows:
+            who = t["holder"] + (f" (person {t['person']})" if t.get("person") else "")
+            L.append(f"- {t['name']}  ({t['task'] or 'no task record saved'})")
+            if t["state"] == "claimed":
+                L.append(f"  CLAIMED, nothing saved yet: holder {who}, claim {rt.age_text(t['date'])}")
+            else:
+                ahead = (f"{t['ahead']} ahead of {base}, {t['behind']} behind; {t['files']} file(s)" if t["ahead"] else
+                         f"nothing ahead of {base} (landed, or not begun)")
+                L.append(f"  BACKED UP: holder {who}, tip {t['tip'][:10]} {rt.age_text(t['date'])}"
+                         + (" (a snapshot that includes uncommitted files)" if t.get("snapshot") else "") + f"; {ahead}")
+            if t.get("land_refused"):
+                L.append(f"  {refused_line(t['land_refused'])}")
+            if t.get("continues"):
+                L.append(f"  continues an earlier attempt: {t['continues']}")
+            if t.get("objective"):
+                L.append(f"  objective: {t['objective']}")
+            if label == "other clones" and t["state"] == "backed-up" and t["ahead"]:
+                L.append(f"  continue it as a new attempt of your own: python3 .agents/bin/session resume {t['name']}")
+    if not rem["tasks"]:
+        L.append("no claimed or backed-up task on the remote")
+    return L
 
 
 def cmd_status(a):
@@ -1061,6 +1713,7 @@ def cmd_status(a):
     ov = overlaps(ss)
     EVENT["attrs"].update(sessions=len(ss), overlaps=len(ov))
     backup_readings(ss)
+    rem = remote_work(primary, base) if getattr(a, "all", False) else None  # kit 40
     off = os.environ.get(WIP_SWITCH, "").strip() == "0"
     EVENT["attrs"]["backup_off"] = off
     pbranch = git(primary, "branch", "--show-current", check=False) or "(detached)"
@@ -1070,7 +1723,7 @@ def cmd_status(a):
     if a.json:
         print(json.dumps({"primary": str(primary), "primary_branch": pbranch, "primary_dirty": pdirty,
                           "primary_staged": pstaged, "primary_behind": pbehind, "backup_off_in_shell": off,
-                          "sessions": ss, "overlaps": ov}, indent=2))
+                          "sessions": ss, "overlaps": ov, **({"remote": rem} if rem is not None else {})}, indent=2))
         return 1 if ov else 0
     if off:
         print(f"backups: OFF in this shell ({WIP_SWITCH}=0 is set): commits made from it push no backup to origin. "
@@ -1090,6 +1743,8 @@ def cmd_status(a):
         if s.get("stopped_land"):
             print(f"  LAND STOPPED at a rebase conflict on {s['stopped_land']}: resolve by meaning, `git add` the files, "
                   "`git rebase --continue`, then `session land` again")
+        if s.get("land_refused"):
+            print(f"  {refused_line(s['land_refused'])}")
         if s["objective"]:
             print(f"  objective: {s['objective']}")
         print(f"  {len(s['changed'])} changed file(s), {s['uncommitted']} uncommitted; {s['ahead']} ahead, {s['behind']} behind {base}")
@@ -1097,6 +1752,8 @@ def cmd_status(a):
             print(f"  {backup_line(s['backup'])}")
     for o in ov:
         print(f"\nOVERLAP {o['left']} and {o['right']}: files {o['files'][:10]} owned {o['owned'][:5]}")
+    if rem is not None:
+        print("\n".join(remote_lines(rem, base)))
     return 1 if ov else 0
 
 
@@ -1145,6 +1802,16 @@ def land_message(top, base, title, branch, since=None):
     for l in git(top, "log", "--reverse", "--format=%(trailers:only,unfold)", f"{since}..HEAD").splitlines():
         if l.strip() and l not in trailers:
             trailers.append(l)
+    # Kit 39: a combined landing names every other author whose commits it squashes, so no one's contribution
+    # collapses into the lander's identity (the 2026-11-17 two-person trial, P6). The names are the commits' own
+    # git config identities: supplied, not verified.
+    me = git(top, "var", "GIT_AUTHOR_IDENT", check=False).rsplit(">", 1)[0] + ">"
+    have = {l.lower() for l in trailers}
+    for who in git(top, "log", "--reverse", "--format=%an <%ae>", f"{since}..HEAD").splitlines():
+        line = f"Co-authored-by: {who}"
+        if who.strip() and who != me and line.lower() not in have:
+            trailers.append(line)
+            have.add(line.lower())
     body = "\n".join(f"- {x}" for x in subjects) if len(subjects) > 1 else ""
     note = f"Landed locally by session land from {branch} (WS-DDR-143 amendment 2026-09-24)."
     return "\n\n".join(x for x in (subject, body, note, "\n".join(trailers)) if x)
@@ -1611,6 +2278,11 @@ def task_for_branch(top, branch):
 
 
 def _signal_stub(top, primary, pin, task, branch, base):
+    # Kit 39 (2026-11-16, process review rank 7, Brien: "Yes, all five"): the per-land stub is off by default. The
+    # decision lives in the commit and the Witness event; a repo that wants the old stub sets "signal_stub": true.
+    if policy(top).get("signal_stub") is not True:
+        EVENT["attrs"]["signal_stub"] = "skipped_off"
+        return
     task = task or task_for_branch(top, branch)
     if not task:
         EVENT["attrs"]["signal_stub"] = "skipped_no_task"
@@ -1715,6 +2387,45 @@ def land_gates(a, top, primary, pin, task_rec, branch, base, verdict, retry=Fals
     return kf
 
 
+def land_refused(top, t, branch):
+    """Kit 40 (M27): after a land refused on a conflict with someone else's landing, the task's record must not read
+    complete, and the refusal must be where both owners can see it. The close this land made is reopened (status
+    blocked, the landing it conflicts with by commit and author, the files), folded into the same unpushed commit or
+    added as one more, and the branch is backed up now (a land turns the commit hook's backup off for itself), so the
+    refused work and its record are on the remote, where the other owner's `status --all` shows the refusal."""
+    EVENT["attrs"].update(reason="owners_decide", conflict_landings=len(CONFLICT.get("landings") or []))
+    try:
+        if t and t.is_file():
+            task = json.loads(t.read_text())
+            task["status"] = "blocked"
+            task.pop("landed", None)
+            task["land_refused"] = {
+                "at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+                "files": (CONFLICT.get("files") or [])[:50],
+                "landings": [{k: r[k] for k in ("commit", "author", "email", "date", "branch")}
+                             for r in (CONFLICT.get("landings") or [])[:10]],
+                "decision": "open: the two owners decide; no agent chooses"}
+            t.write_text(json.dumps(task, indent=2) + "\n")
+            git(top, "add", str(t.relative_to(top)))
+            h = top / task.get("handoff", "")
+            if h.is_file():
+                h.write_text(re.sub(r"^- Status: .*$", "- Status: blocked", h.read_text(), count=1, flags=re.M))
+                git(top, "add", str(h.relative_to(top)))
+            if pushed(top):
+                commit(top, task.get("provider", "claude"), "-q", "-m",
+                       f"session: land refused for {task['id']}, the owners decide")
+            else:
+                commit(top, task.get("provider", "claude"), "-q", "--amend", "--no-edit")
+            print(f"The task record {t.relative_to(top)} reads blocked, not complete, and names the landing.")
+        if branch.startswith(WIP_BRANCHES):
+            run([sys.executable, str(Path(__file__).resolve()), "wip-backup", "--quiet"], top, check=False,
+                env={WIP_SWITCH: "1"})
+            print(f"The refused work is backed up as {wip_ref(branch)}: `python3 .agents/bin/session status --all` in "
+                  "the other owner's clone shows it and this refusal.")
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - the refusal stands whether or not its record could be written
+        print(f"note: the refusal could not be written into the task record ({type(e).__name__}); the land is still refused")
+
+
 def cmd_land(a):
     top, primary, linked = here(a.here)
     if not linked:
@@ -1732,9 +2443,15 @@ def cmd_land(a):
     t = my_task(top, f"origin/{base}")
     if t:
         task = json.loads(t.read_text())
-        if task.get("status") != "complete":
+        decided = (getattr(a, "owners_decided", None) or "").strip()
+        if task.get("status") != "complete" or (decided and (task.get("conflict_decision") or {}).get("text") != decided):
             task["status"] = "complete"
             task["landed"] = dt.datetime.now().astimezone().isoformat(timespec="seconds")
+            if decided:  # kit 40: the owners' decision after a refused land, on the record that lands
+                task["conflict_decision"] = {"text": decided, "at": task["landed"],
+                                             "recorded_by": git(top, "var", "GIT_AUTHOR_IDENT", check=False).rsplit(">", 1)[0] + ">"}
+                if isinstance(task.get("land_refused"), dict):
+                    task["land_refused"]["decision"] = "decided: see conflict_decision"
             t.write_text(json.dumps(task, indent=2) + "\n")
             h = top / task.get("handoff", "")
             if h.is_file():
@@ -1752,8 +2469,11 @@ def cmd_land(a):
     branch = git(top, "branch", "--show-current")
     if git(top, "rev-list", "--count", f"origin/{base}..HEAD") == "0":
         sys.exit("session: nothing to land")
-    pin = rebase_on_base(top, base, branch)
+    decided = (getattr(a, "owners_decided", None) or "").strip()
+    pin = rebase_on_base(top, base, branch, decided)
     if not pin:
+        if CONFLICT.get("refused"):
+            land_refused(top, t, branch)
         return 3
     if git(top, "rev-list", "--count", f"{pin}..HEAD") == "0":
         print(f"nothing new to land: everything on this branch is already on origin/{base}")
@@ -1801,8 +2521,10 @@ def cmd_land(a):
                 sys.exit(f"session: push to {base} failed:\n{err}")
             # someone landed in between: take their change and go again
             git(top, "fetch", "-q", "origin", base)
-            pin = rebase_on_base(top, base, branch)
+            pin = rebase_on_base(top, base, branch, decided)
             if not pin:
+                if CONFLICT.get("refused"):
+                    land_refused(top, t, branch)
                 return 3
             # a new tree: the other session's landing is in it, so every gate judges it again (kit 37, V1)
             kf_agent, kf_content, kf_pr = land_gates(a, top, primary, pin, task_rec, branch, base, verdict, retry=True)
@@ -1978,22 +2700,31 @@ def wip_ref(branch):
 
 def drop_wip(cwd, branch):
     """Delete the branch's backup ref on origin, and on the private backup remote when the policy names one (kit 37).
-    Quiet and fail-open: a missing ref or no network is fine."""
+    Kit 39: only when its tip is this clone's work (retirement.guarded_drop): a ref holding another clone's commit
+    under the same name is left, and the land or finish says whose it is. Fail-open: a missing ref or no network is
+    fine."""
     if not branch or not branch.startswith(WIP_BRANCHES):
+        return
+    try:
+        rt = load_retirement()
+    except (Exception, SystemExit):
         return
     remotes = ["origin"]
     try:
-        extra = load_retirement().private_backup_remote(cwd)
+        extra = rt.private_backup_remote(cwd)
         if extra and extra != "origin":
             remotes.append(extra)
     except (Exception, SystemExit):
         pass
     for remote in remotes:
         try:
-            subprocess.run(["git", "push", "-q", remote, f":{wip_ref(branch)}"], cwd=cwd, capture_output=True,
-                           timeout=60, env=wip_env())
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+            rt.drop_claim(cwd, branch, remote=remote, timeout=60, env=wip_env())  # kit 40: the claim goes with it
+            gone, why = rt.guarded_drop(cwd, branch, remote=remote, timeout=60, env=wip_env())
+        except Exception:  # noqa: BLE001 - fail-open
+            continue
+        if not gone and why.startswith("left "):
+            EVENT["attrs"]["wip_left"] = EVENT["attrs"].get("wip_left", 0) + 1
+            print(f"backup ref {why}; it is not this clone's to remove")
 
 
 def wip_env():
@@ -2054,16 +2785,24 @@ def cmd_wip_backup(a):
                     return 0
                 time.sleep(0.2)
         tip = git(top, "rev-parse", "-q", "--verify", f"refs/heads/{branch}", check=False, env=READ_ONLY)
+        # Kit 39: never a blind forced push. The remote ref is read first and the push carries a lease on what it held;
+        # a ref holding a commit this clone did not write (another person's clone that started the same task name) is
+        # refused and left as it is, and this work stays on this machine (retirement.guarded_push).
         try:
-            r = subprocess.run(["git", "push", "-q", remote, f"+{tip or 'refs/heads/' + branch}:{wip_ref(branch)}"],
-                               cwd=top, capture_output=True, text=True, timeout=WIP_TIMEOUT, env=wip_env())
-            err, rc = (r.stderr or r.stdout).strip(), r.returncode
-        except subprocess.TimeoutExpired:
-            err, rc = "timed out", 124
-        except OSError as e:
-            err, rc = str(e), 127
+            result, err = load_retirement().guarded_push(top, tip, wip_ref(branch), remote=remote, branch=branch,
+                                                         gitdirs=(gitdir,), timeout=WIP_TIMEOUT, env=wip_env())
+        except Exception as e:  # noqa: BLE001 - a backup never fails a commit
+            result, err = "error", f"{type(e).__name__}: {e}"
+        rc = 0 if result in ("pushed", "current") else 1
     if rc == 0:
         EVENT["attrs"]["decision"] = "pushed" if remote == "origin" else "pushed-private"
+    elif result == load_retirement().FOREIGN:
+        EVENT["outcome"] = "blocked"
+        EVENT["attrs"]["decision"] = "refused_foreign"
+        if not a.quiet:
+            print(f"session: backup of {branch} NOT pushed: {err}", file=sys.stderr)
+        record_backup(gitdir, load_retirement().FOREIGN, tip, branch, err)
+        return 0
     else:
         EVENT["outcome"] = "error"
         EVENT["attrs"]["decision"] = ("offline" if re.search(r"resolve host|timed out|Network is unreachable|"
@@ -2155,7 +2894,25 @@ def main():
     s.add_argument("--provider"); s.add_argument("--objective")
     s.add_argument("--robot", action="store_true", help="a scheduled job's run: the reaper retires it once a later run of the same job supersedes it (kit 29)")
     s.add_argument("--here", action="store_true", help="adopt the session worktree you are in (the desktop app's .claude/worktrees/<name>) instead of cutting a sibling; the repository it belongs to is the one meant, even if this script belongs to another")
+    s.add_argument("--batch", metavar="ID", help="this lane is one of a batch's parallel lanes: cut it only above the "
+                   "batch line (SESSION_BATCH_FREE_GB, default the warning line), else exit 75 so the batch queues it "
+                   "(kit 41)")
+    s = sub.add_parser("capacity", help="how many more lanes of this repository fit above the batch line now: exit 0 "
+                       "when all --lanes fit, 75 when some must queue (kit 41; read-only)")
+    s.add_argument("--lanes", type=int, default=1, help="lanes the batch wants to run at once (default 1)")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--here", action="store_true", help=other)
     s = sub.add_parser("status"); s.add_argument("--json", action="store_true")
+    s.add_argument("--all", action="store_true", help="also list every task the remote holds as a claim or a backup, "
+                   "other clones' included: holder, age, and whether it is ahead of the base branch (kit 40; read-only)")
+    s.add_argument("--here", action="store_true", help=other)
+    s = sub.add_parser("resume", help="continue another clone's unlanded task as a new attempt under this clone's own "
+                       "name; the earlier attempt's refs and commits are never changed (kit 40)")
+    s.add_argument("task", help="the task to continue: its backup ref, branch, task id or bare task name, as "
+                   "`status --all` lists it")
+    s.add_argument("--as", dest="as_name", metavar="NAME", help="the new attempt's task name (default: <task>-cont)")
+    s.add_argument("--own", action="append", default=[], help="owned paths (default: the earlier attempt's)")
+    s.add_argument("--provider"); s.add_argument("--objective")
     s.add_argument("--here", action="store_true", help=other)
     s = sub.add_parser("land"); s.add_argument("--title")
     s.add_argument("--pr", action="store_true", help="land through a pull request even where local landing is allowed")
@@ -2164,6 +2921,9 @@ def main():
     s.add_argument("--kf11-verdict", choices=("yes", "no"), help="record the KF-11 reviewer's answer in the review "
                    "block (who and when, with --kf11-reviewer); no refuses the land (kit 34)")
     s.add_argument("--kf11-reviewer", metavar="NAME", help="the person who read the KF-11 diff (with --kf11-verdict)")
+    s.add_argument("--owners-decided", metavar="TEXT", help="after a land refused on a conflict with someone else's "
+                   "landing: who decided and what, in a few words. It goes into the task record, and this land then "
+                   "stops at the conflict with the rebase open, to apply that decision (kit 40)")
     s.add_argument("--here", action="store_true", help=other)
     s = sub.add_parser("finish"); s.add_argument("--task")
     s.add_argument("--here", action="store_true", help=other)
@@ -2180,7 +2940,8 @@ def main():
     a = p.parse_args()
     started, code = time.monotonic(), "uncaught exception"
     EVENT["verb"] = a.cmd
-    verbs = {"start": cmd_start, "status": cmd_status, "land": cmd_land, "finish": cmd_finish,
+    verbs = {"start": cmd_start, "capacity": cmd_capacity, "status": cmd_status, "resume": cmd_resume,
+             "land": cmd_land, "finish": cmd_finish,
              "commit-guard": cmd_commit_guard, "retire": cmd_retire, "wip-backup": cmd_wip_backup}
     try:
         code = verbs[a.cmd](a) or 0

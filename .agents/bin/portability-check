@@ -26,7 +26,7 @@ from pathlib import Path
 TESTS_PY = "test_no_hardcoded_home.py"
 TESTS_SH = "test-no-hardcoded-home.sh"
 ZERO = "0" * 40
-BACKUP_REFS = ("refs/wip/", "refs/tags/archive/")  # pushed by the backup hook and by retirements, never landed
+BACKUP_REFS = ("refs/wip/", "refs/claims/", "refs/tags/archive/")  # the backup hook's, a start's claim (kit 40), a retirement's: never landed
 
 RUNNER = r"""
 import importlib.util, inspect, sys, traceback, unittest

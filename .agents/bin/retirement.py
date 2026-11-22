@@ -318,12 +318,17 @@ def wip_ref(branch):
     return WIP_NS + branch
 
 
-def drop_wip(cwd, branch, timeout=60):
-    """Delete the branch's backup ref on origin (kit 29). True when it is gone or never existed. Never raises."""
+def drop_wip(cwd, branch, timeout=60, tips=()):
+    """Delete the branch's backup ref on origin (kit 29), only when its tip is this clone's work (kit 39,
+    guarded_drop). True when it is gone or never existed; False when it was left (another clone's commit, or origin
+    could not be asked). Never raises."""
     if not branch:
         return True
-    rc, _, err = git(cwd, "push", "-q", "origin", f":{wip_ref(branch)}", timeout=timeout)
-    return rc == 0 or "remote ref does not exist" in err or "unable to delete" in err
+    try:
+        drop_claim(cwd, branch, timeout=timeout)  # kit 40: this clone's claim on the name goes with its backup
+        return guarded_drop(cwd, branch, tips=tips, timeout=timeout)[0]
+    except Exception:  # noqa: BLE001 - never raises
+        return False
 
 
 def wip_heads(cwd, timeout=60, remote="origin"):
@@ -337,6 +342,312 @@ def wip_heads(cwd, timeout=60, remote="origin"):
         if ref.startswith(WIP_NS):
             heads[ref[len(WIP_NS):]] = sha
     return heads
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Two people, one repository (kit 39)
+#
+# A trial on 2026-11-17 (wow-acceptance harness/two_person, eleven probes, two clones of one scratch repository) found
+# that a backup ref is a shared name with no owner: two clones that start the same task name write one refs/wip/<branch>,
+# the commit hook force-pushed over the other clone's commit, and land, finish, retire and the reaper deleted the ref
+# whoever wrote it, so one person's unlanded work left origin while that person's own status still read "current".
+# Now every write and every removal of a backup ref is guarded:
+#   - guarded_push() never overwrites blind: it reads the remote ref, pushes with a lease on the value it read, and
+#     refuses when the remote holds a commit this clone did not write (not in this clone's own-work log or backup
+#     records, and not reachable from the local branch, its reflog or the commit being pushed);
+#   - guarded_drop() removes a backup ref only when its tip is this clone's work by the same test, with a lease;
+#   - the own-work log (session-own.jsonl in the clone's common git dir, never committed) records each backup this
+#     clone pushed and each task it started, so `session start` can tell its own earlier name from someone else's.
+# A push or delete with a `+` refspec bypasses the lease (checked with git 2.56), so neither ever uses one.
+OWN_LOG = "session-own.jsonl"
+FOREIGN = "refused-foreign"  # a backup push refused: the remote ref holds a commit this clone did not write
+REFLOG_DEPTH = 500
+
+
+def common_dir(cwd):
+    rc, out, _ = git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    return Path(out) if rc == 0 and out else None
+
+
+def own_note(cwd, kind, **fields):
+    """Append one line to this clone's own-work log (kind "wip": a backup pushed; "start": a task started). Never raises."""
+    try:
+        cd = common_dir(cwd)
+        if cd is None:
+            return
+        rec = {"kind": kind, "at": datetime.now().astimezone().isoformat(timespec="seconds"), **fields}
+        with open(cd / OWN_LOG, "a") as fh:
+            fh.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
+def own_log(cwd):
+    """Every record of this clone's own-work log; [] when there is none."""
+    cd = common_dir(cwd)
+    try:
+        lines = (cd / OWN_LOG).read_text().splitlines() if cd else []
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            out.append(d)
+    return out
+
+
+def own_started(cwd, branch):
+    """True when this clone started a task on `branch` (its own-work log, or the branch exists here)."""
+    if any(d.get("kind") == "start" and d.get("branch") == branch for d in own_log(cwd)):
+        return True
+    return git(cwd, "rev-parse", "-q", "--verify", f"refs/heads/{branch}")[0] == 0
+
+
+def own_pushed(cwd, ref, sha, gitdirs=()):
+    """True when this clone pushed `sha` to `ref`: its own-work log, or a good backup record in one of `gitdirs`
+    (the record a kit 38 commit hook or reaper left before the log existed)."""
+    if not sha:
+        return False
+    if any(d.get("kind") == "wip" and d.get("ref") == ref and d.get("sha") == sha for d in own_log(cwd)):
+        return True
+    for gd in gitdirs:
+        for rec in (read_backup_records(gd).values() if gd else []):
+            if rec.get("ref") in ("", ref) and sha in (rec.get("target"), rec.get("last_ok_head")):
+                return True
+    return False
+
+
+def has_commit(cwd, sha):
+    return bool(sha) and git(cwd, "cat-file", "-e", f"{sha}^{{commit}}")[0] == 0
+
+
+def sha_owned(cwd, ref, sha, branch=None, tips=(), gitdirs=()):
+    """True when `sha` (a remote backup tip) is this clone's work: pushed by this clone, or reachable from the local
+    branch, any commit the branch's reflog names, or one of `tips` (the commit being pushed, a tag just made)."""
+    if own_pushed(cwd, ref, sha, gitdirs):
+        return True
+    if not has_commit(cwd, sha):
+        return False
+    cands = [t for t in tips if t]
+    if branch:
+        rc, out, _ = git(cwd, "rev-parse", "-q", "--verify", f"refs/heads/{branch}")
+        if rc == 0 and out:
+            cands.append(out)
+        rc, out, _ = git(cwd, "reflog", "show", "--format=%H", f"refs/heads/{branch}")
+        if rc == 0:
+            cands += out.split()[:REFLOG_DEPTH]
+    cands = list(dict.fromkeys(cands))
+    for c in cands:
+        if c == sha or git(cwd, "merge-base", "--is-ancestor", sha, c)[0] == 0:
+            return True
+    # A reaper snapshot pushed before the own-work log existed (kit 38): a "wip snapshot" commit by this clone's own
+    # git identity whose first parent is this clone's work. Without this rule every upgraded clone's first backup
+    # after a reaper run would be refused as someone else's.
+    rc, out, _ = git(cwd, "log", "-1", "--format=%P%x1f%ce%x1f%s", sha)
+    parts = out.split("\x1f") if rc == 0 else []
+    me = git(cwd, "config", "--get", "user.email")[1]
+    if len(parts) == 3 and parts[2].startswith("wip snapshot") and me and parts[1] == me and parts[0]:
+        first = parts[0].split()[0]
+        return any(c == first or git(cwd, "merge-base", "--is-ancestor", first, c)[0] == 0 for c in cands)
+    return False
+
+
+def remote_sha(cwd, ref, remote="origin", timeout=60, env=None):
+    """(asked, sha): `ref`'s commit on `remote`, "" when it has none; asked is False when the remote cannot be read."""
+    rc, out, _ = git(cwd, "ls-remote", remote, ref, timeout=timeout, env=env)
+    if rc:
+        return False, ""
+    for line in out.splitlines():
+        s, _, r = line.partition("\t")
+        if r == ref:
+            return True, s
+    return True, ""
+
+
+def fetch_tip(cwd, ref, remote="origin", timeout=60, env=None):
+    """Fetch the objects of `ref` without writing any ref or FETCH_HEAD, so its tip can be read and compared."""
+    git(cwd, "fetch", "-q", "--no-write-fetch-head", remote, ref, timeout=timeout, env=env)
+
+
+def tip_owner(cwd, sha):
+    """(author, committer date in ISO form) of a commit this clone holds; ("an unknown author", "") otherwise."""
+    rc, out, _ = git(cwd, "log", "-1", "--format=%an%x1f%cI", sha)
+    if rc or "\x1f" not in out:
+        return "an unknown author", ""
+    a, d = out.split("\x1f", 1)
+    return a or "an unknown author", d
+
+
+def age_text(iso):
+    try:
+        s = max(0.0, time.time() - datetime.fromisoformat(iso).timestamp())
+    except (TypeError, ValueError):
+        return "of unknown age"
+    return f"{round(s / 60)} min old" if s < 3600 else f"{s / 3600:.1f} h old" if s < 172800 else f"{s / 86400:.1f} d old"
+
+
+def foreign_text(cwd, ref, sha, remote="origin"):
+    who, when = tip_owner(cwd, sha)
+    return (f"{remote}'s {ref} holds {sha[:10]} by {who}" + (f", committed {when} ({age_text(when)})" if when else "")
+            + ", a commit this clone did not write")
+
+
+def guarded_push(cwd, target, ref, remote="origin", branch=None, tips=(), gitdirs=(), timeout=GIT_TIMEOUT, env=None):
+    """Push `target` to `ref` on `remote` without overwriting blind (kit 39). Returns (result, detail): "pushed",
+    "current" (the remote already holds it), FOREIGN (the remote holds a commit this clone did not write: nothing was
+    pushed, the detail names its author and date) or "error"."""
+    asked, have = remote_sha(cwd, ref, remote, env=env)
+    if not asked:
+        return "error", f"{remote} could not be asked for {ref}"
+    if have == target:
+        own_note(cwd, "wip", ref=ref, sha=target, remote=remote)
+        return "current", ""
+    if have and not sha_owned(cwd, ref, have, branch, (target, *tips), gitdirs):
+        if not has_commit(cwd, have):
+            fetch_tip(cwd, ref, remote, env=env)
+        if not sha_owned(cwd, ref, have, branch, (target, *tips), gitdirs):
+            return FOREIGN, foreign_text(cwd, ref, have, remote) + "; nothing was pushed, this work stays on this machine"
+    rc, _, err = git(cwd, "push", "-q", f"--force-with-lease={ref}:{have}", remote, f"{target}:{ref}", timeout=timeout,
+                     env=env)
+    if rc == 0:
+        own_note(cwd, "wip", ref=ref, sha=target, remote=remote)
+        return "pushed", ""
+    if "stale info" in err or "rejected" in err:  # someone wrote the ref between the read and the push
+        asked, now = remote_sha(cwd, ref, remote, env=env)
+        if asked and now:
+            fetch_tip(cwd, ref, remote, env=env)
+            return FOREIGN, foreign_text(cwd, ref, now, remote) + "; nothing was pushed, this work stays on this machine"
+    return "error", " ".join(err.split())[:200]
+
+
+def guarded_drop(cwd, branch, remote="origin", tips=(), gitdirs=(), ref=None, timeout=60, env=None):
+    """Delete a backup ref (refs/wip/<branch>, or `ref`) only when its tip is this clone's work (kit 39), with a lease
+    on that tip. Returns (gone, detail): gone is True when the ref is gone or never existed; detail says why it was
+    left (another clone's commit, or the remote could not be asked)."""
+    ref = ref or wip_ref(branch)
+    asked, have = remote_sha(cwd, ref, remote, timeout=timeout, env=env)
+    if not asked:
+        return False, f"{remote} could not be asked for {ref}; it was left as it is"
+    if not have:
+        return True, ""
+    if not sha_owned(cwd, ref, have, branch, tips, gitdirs):
+        if not has_commit(cwd, have):
+            fetch_tip(cwd, ref, remote, timeout=timeout, env=env)
+        if not sha_owned(cwd, ref, have, branch, tips, gitdirs):
+            return False, f"left {ref}: " + foreign_text(cwd, ref, have, remote)
+    rc, _, err = git(cwd, "push", "-q", f"--force-with-lease={ref}:{have}", remote, f":{ref}", timeout=timeout, env=env)
+    if rc == 0 or "remote ref does not exist" in err:
+        return True, ""
+    return False, f"left {ref}: the delete was refused ({' '.join(err.split())[:160]})"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# A task name is claimed on the remote at start (kit 40)
+#
+# Kit 39's start check reads what origin holds, and origin holds nothing for a task until its first commit is backed
+# up. Two clones that started one name inside that window both started (kit-39-trial-2026-11-18.md, "Not verified").
+# `session start` now writes refs/claims/<branch> before it creates anything: one small commit (the empty tree, no
+# parent) whose author is this clone's git identity and whose message names the branch, the task, the person slug
+# when one is set and a random nonce, so two clones never make the same commit. The push is create-only
+# (`--force-with-lease=<ref>:` with an empty expected value: the ref must not exist), and the remote settles two of
+# them in one ref update: exactly one lands. The loser reads the ref and is told the holder. This clone's own-work
+# log records the claim BEFORE the push, so a start that dies between the claim and the worktree leaves a claim this
+# clone recognises as its own the next time, and one every other clone can read (holder, age) and step past by name
+# with SESSION_ALLOW_NAME_IN_USE=1: never a lock without an owner or a way round. A claim is removed with the backup
+# ref, by the clone that wrote it, with a lease on the commit it wrote.
+CLAIM_NS = "refs/claims/"
+CLAIM_SUBJECT = "session claim: "
+
+
+def claim_ref(branch):
+    return CLAIM_NS + branch
+
+
+def own_claimed(cwd, ref, sha):
+    """True when this clone made the claim commit `sha` for `ref` (its own-work log)."""
+    return bool(sha) and any(d.get("kind") == "claim" and d.get("ref") == ref and d.get("sha") == sha
+                             for d in own_log(cwd))
+
+
+def claim_info(cwd, sha):
+    """What a claim commit this clone holds says: author, email, date (ISO), task, person, branch. {} when unread."""
+    rc, out, _ = git(cwd, "log", "-1", "--format=%an%x1f%ae%x1f%cI%x1f%B", sha)
+    parts = out.split("\x1f", 3) if rc == 0 else []
+    if len(parts) < 4:
+        return {}
+    info = {"author": parts[0] or "an unknown author", "email": parts[1], "date": parts[2]}
+    for line in parts[3].splitlines():
+        k, sep, v = line.partition(": ")
+        if sep and k in ("branch", "task", "person") and v.strip() not in ("", "-"):
+            info[k] = v.strip()
+    return info
+
+
+def claim_text(cwd, ref, sha, remote="origin"):
+    i = claim_info(cwd, sha)
+    who = i.get("author", "an unknown author") + (f" (person {i['person']})" if i.get("person") else "")
+    return f"{remote}'s {ref} is a claim by {who}" + (f", made {i['date']} ({age_text(i['date'])})" if i.get("date") else "")
+
+
+def claim_name(cwd, branch, task="", person="", remote="origin", timeout=60, env=None):
+    """Claim `branch` on `remote` with a create-only push of a small claim commit. Returns (result, detail):
+    "claimed" (this call made it; detail is the commit), "own" (this clone already holds it: an earlier start of the
+    same name, or one that died after its claim), "held" (another clone holds it; detail names the holder and the
+    claim's age; nothing was written) or "unasked" (the remote could not be asked or took no claim; detail says why).
+    Never raises."""
+    ref = claim_ref(branch)
+    try:
+        rc, tree, err = git(cwd, "hash-object", "-w", "-t", "tree", os.devnull)
+        if rc == 0 and tree:
+            msg = (f"{CLAIM_SUBJECT}{task or branch}\n\nbranch: {branch}\ntask: {task or '-'}\nperson: {person or '-'}\n"
+                   f"nonce: {os.urandom(8).hex()}\n")
+            rc, sha, err = git(cwd, "commit-tree", tree, "-m", msg)
+        if rc or not sha:
+            return "unasked", f"the claim commit could not be made ({' '.join(err.split())[:120]})"
+        own_note(cwd, "claim", ref=ref, sha=sha, branch=branch, task=task, remote=remote)
+        rc, _, err = git(cwd, "push", "-q", f"--force-with-lease={ref}:", remote, f"{sha}:{ref}", timeout=timeout, env=env)
+        if rc == 0:
+            return "claimed", sha
+        asked, have = remote_sha(cwd, ref, remote, timeout=timeout, env=env)
+        if not asked:
+            return "unasked", f"{remote} could not be asked for {ref}"
+        if not have:
+            return "unasked", f"{remote} took no claim ({' '.join(err.split())[:120]})"
+        if own_claimed(cwd, ref, have):
+            return "own", have
+        if not has_commit(cwd, have):
+            fetch_tip(cwd, ref, remote, timeout=timeout, env=env)
+        return "held", claim_text(cwd, ref, have, remote)
+    except Exception as e:  # noqa: BLE001 - never raises
+        return "unasked", f"{type(e).__name__}: {e}"
+
+
+def drop_claim(cwd, branch, remote="origin", timeout=60, env=None):
+    """Remove this clone's claim on `branch` (kit 40), with a lease on the claim commit this clone wrote. Returns
+    (gone, detail): gone is True when the ref is gone or never existed; a claim another clone wrote is left, and the
+    detail names its holder. Never raises."""
+    ref = claim_ref(branch)
+    try:
+        asked, have = remote_sha(cwd, ref, remote, timeout=timeout, env=env)
+        if not asked:
+            return False, f"{remote} could not be asked for {ref}; it was left as it is"
+        if not have:
+            return True, ""
+        if not own_claimed(cwd, ref, have):
+            if not has_commit(cwd, have):
+                fetch_tip(cwd, ref, remote, timeout=timeout, env=env)
+            return False, f"left {ref}: " + claim_text(cwd, ref, have, remote)
+        rc, _, err = git(cwd, "push", "-q", f"--force-with-lease={ref}:{have}", remote, f":{ref}", timeout=timeout, env=env)
+        if rc == 0 or "remote ref does not exist" in err:
+            return True, ""
+        return False, f"left {ref}: the delete was refused ({' '.join(err.split())[:160]})"
+    except Exception as e:  # noqa: BLE001 - never raises
+        return False, f"left {ref}: {type(e).__name__}: {e}"
+
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -1121,7 +1432,7 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
         rec["kept_aside"] = aside_rel or ""
         rec["moved_files"] = carry_ignored(primary, wt, plan["carry"])
         rec["freed_mb"] = remove_worktree(primary, wt, branch, tag)
-        rec["wip_dropped"] = False if archived or withheld else drop_wip(primary, branch)
+        rec["wip_dropped"] = False if archived or withheld else drop_wip(primary, branch, tips=(head,))
         rec["action"] = "retired"
         rec["reason"] = reason or "retired by hand"
     except (RuntimeError, OSError) as e:
