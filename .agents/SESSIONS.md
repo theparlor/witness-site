@@ -67,7 +67,9 @@ python3 .agents/bin/session start <task> --own <path> --objective "<one line>"
 ```
 
 Creates the worktree and branch and prints the worktree path. Do all your work there. It first
-checks free disk, and refuses when the new checkout would leave too little (kit 21, below).
+checks free disk, and refuses when the new checkout would leave too little (kit 21, below). A
+batch that runs lanes in parallel passes `--batch <id>` on each lane and asks `session capacity`
+first (kit 41, below).
 
 ```bash
 python3 .agents/bin/session status
@@ -79,6 +81,20 @@ primary checkout is (`primary: N behind`), so a landed change that has not reach
 checkout is visible before anyone opens a stale file from it. Since kit 35 it also gives each
 session's backup on origin (current, behind, failing or none, with its age), names a land stopped
 at a rebase conflict by its branch, and says first when backups are off in the shell.
+
+```bash
+python3 .agents/bin/session status --all
+```
+
+The same, plus what the remote holds for every clone: each claimed or backed-up task, its holder,
+its age and whether it is ahead of main. Read-only, and it needs no person to be set (kit 40, below).
+
+```bash
+python3 .agents/bin/session resume <task, branch or backup ref>
+```
+
+Continues another clone's unlanded task as a new attempt of your own: a new branch, worktree and
+task record that cite the attempt they continue. The earlier attempt is only read (kit 40, below).
 
 ```bash
 python3 .agents/bin/session land
@@ -94,8 +110,9 @@ says so, squash-merging it or leaving it open for a human when it touches an ask
 `--pr` forces a PR; `--no-merge` opens one and leaves it. When the landing completes in line,
 `land` also fast-forwards the primary checkout; when a PR's auto-merge is armed (checks still
 running) the primary lags until `finish` runs or the hub's primary-ff sweep passes, and `land`
-says so. If the rebase hits a conflict it stops and lists
+says so. If the rebase hits a conflict with another of your own sessions it stops and lists
 the files: resolve them by meaning, `git add` them, `git rebase --continue`, run `land` again.
+A conflict with another person's landing is refused instead, and the two owners decide (kit 40, below).
 
 After a landing your branch points at the commit that landed it (same files, so nothing in the
 worktree changes), and you can keep working in the same worktree and land again: the next `land`
@@ -258,6 +275,39 @@ starts anyway, for that one command. The Witness event of a `start` carries the 
 (`free_gb`, `estimate_gb`) and the result (`disk_guard`: `guard_ok`, `guard_warn`,
 `guard_refused`, `guard_overridden`, or `guard_skipped` when measuring failed); a refusal is
 reported as `blocked` with reason `low_disk`.
+
+### Batch lanes wait above a batch line (kit 41)
+
+The floor judges one start at a time. On 18 November 2026 a persona batch cut fourteen
+worktrees of one repository at once, and its fetch step cut one more for each landing. Every
+start passed the floor on its own, but the checkout grew from 1.4 to 5 GB within a day as the
+batch's pages landed. The next day ten such worktrees held 44 GB and the disk had 6.9 GB free.
+
+A lane a batch cuts for width is optional, so it may only use the space above a higher line:
+
+```bash
+python3 .agents/bin/session capacity --lanes <N> --json
+python3 .agents/bin/session start <task> --batch <batch id> --own <path>
+```
+
+- `capacity` measures free space and what one more lane takes (each file rounded up to the
+  4 KiB block the disk gives it, which matched a measured 5.0 GB lane to within 1 percent), and
+  says how many of N lanes fit above the batch line now: `start` that many, `queue` the rest.
+  Exit 0 when all fit, 75 when some must wait, 1 when it could not measure. It changes nothing.
+- `start --batch` cuts the lane only if the disk stays above the batch line after it. If not,
+  it exits 75 and creates nothing: no worktree, no branch, no claim, no task file. Exit 75 means
+  the lane is queued, not failed. `SESSION_ALLOW_LOW_DISK=1` does not admit a batch lane.
+- A queued lane starts once a running lane has landed and `session finish` has freed its
+  checkout. Ask `capacity` again then.
+- The batch line is the warning line (25 GB) unless `SESSION_BATCH_FREE_GB` moves it. The room
+  between it and the 10 GB floor stays for the worktrees that land work (a fetch step's land
+  worktree, a batch's close) and for swap, which uses the same disk. Those start without
+  `--batch` and are judged by the floor alone, so a batch's own lanes never take the space its
+  landings need.
+- The task record of a batch lane carries `batch: <id>`. The Witness event carries `lane_gb`,
+  `batch_line_gb` and `batch_guard` (`batch_admitted`, `batch_queued`, or `batch_skipped` when
+  measuring failed, which lets the start go on to the floor); a queued lane is reported as
+  `blocked` with reason `batch_line`. The batch name is not in the event.
 
 ### Content changes over 25 files land as a reviewed diff (KF-11, kits 23 and 34)
 
@@ -509,6 +559,94 @@ named; a date deeper than the first folder is not named (a client's own subfolde
 edit or deletion is the existing error. The two patterns are Check 31's, held identical by a test in the kit's suite.
 The land's Witness event carries `date_folder_warnings`, a count (0 when the audit ran and found none), never a
 folder name.
+
+### Two people in one repository cannot overwrite or remove one another's work (kit 39)
+
+A trial with two clones of one scratch repository standing for two people (2026-11-17) found that a backup ref is a
+shared name with no owner. Two clones that start the same task name get one branch name, one task id and one
+`refs/wip/<branch>`; the commit hook's forced push replaced the other clone's commit, and land, finish, retire and the
+reaper deleted the ref whoever wrote it, while the other person's `status` still read `current`. Now:
+
+- **A backup is never overwritten blind.** The backup push reads the remote ref first and pushes with a lease on that
+  value. When the ref holds a commit this clone did not write (not in this clone's own-work log or backup records, and
+  not reachable from the local branch, its reflog or the commit being pushed), nothing is pushed, the work stays on
+  this machine, and the record names the remote tip's author and date (`refused-foreign`; `status` shows it as
+  FAILING). The hourly reaper's backup uses the same guard. A `+` refspec bypasses a lease, so neither uses one.
+- **A backup is removed only when its tip is this clone's work,** by the same test, with a lease on that tip: `land`,
+  `finish`, `retire` and the reaper's retirements. Another clone's commit under the same name is left, and `land` or
+  `finish` says whose it is.
+- **`status` reads the remote.** One read of the backup refs per call. `current` means the remote ref held this HEAD in
+  that read (or this clone's own snapshot on top of it). `NOT CHECKED` means the remote could not be asked, so nothing
+  proves a copy is there; it is never shown as current. `MISSING` means a copy was recorded and the ref is gone;
+  `OVERWRITTEN` means the ref holds a commit this clone did not write, with its author and date.
+- **`start` refuses a name someone else holds.** Before it creates anything it looks on origin for a branch or backup
+  ref of the new branch's name, and for the task's record on the base branch. One this clone did not make refuses the
+  start, naming the holder and its age. The same clone restarting its own task passes (this clone's own-work log,
+  `session-own.jsonl` in the common git dir, never committed). `SESSION_ALLOW_NAME_IN_USE=1` starts anyway, once. An
+  origin that cannot be asked prints a note and the start goes on.
+- **A person in the names, when one is set.** `git config session.person <slug>` in a clone (or `SESSION_PERSON=<slug>`
+  for one command; lowercase letters, digits and hyphens) puts the person into every name: branch
+  `agent/<provider>/<person>/<date>-<task>`, task id `<date>-<provider>-<task>@<person>`, worktree
+  `<repo>-wt-<date>-<task>@<person>`, backup ref `refs/wip/<that branch>`, and a `person` field in the task record.
+  With no slug set every name and record is exactly what kit 38 made. The reaper reads a task name from either shape.
+- **A combined landing names its other authors.** The squash carries a `Co-authored-by:` trailer for every distinct
+  commit author in the landed range other than the lander. These names are the commits' own git config: supplied,
+  not verified.
+
+What this does not do: reserve a landing for one attempt. Seeing another person's open work, continuing it, and two
+starts of one name in the same moment are covered by kit 40, next.
+
+### Two people can see and continue one another's work, and neither is chosen over the other (kit 40)
+
+Four gaps the two-person trial left open after kit 39, closed.
+
+- **A task name is claimed on the remote at start.** Kit 39's start check reads what origin holds, and origin holds
+  nothing for a task until its first commit is backed up, so two clones that started one name inside that window both
+  started. `start` now writes `refs/claims/<branch>` as its last step before it creates anything: one small commit
+  (the empty tree, no parent) whose author is this clone's git identity and whose message names the branch, the task
+  and the person slug when one is set. The push is create-only (a lease that says the ref must not exist), so of two
+  clones the remote takes exactly one. The other is refused before anything is created and is told the holder and the
+  claim's age. The claim is written to this clone's own-work log before the push. A start that dies between its claim
+  and its worktree therefore leaves a claim its own clone takes up again the next time it starts the name, and one any
+  other clone can read and, by name, step past once with `SESSION_ALLOW_NAME_IN_USE=1`. It is never a lock without a
+  named holder or a way round. A claim is removed with the backup ref (`land`, `finish`, `retire`, the reaper), only by
+  the clone that wrote it, with a lease on the commit it wrote. Like the backup, a claim goes only where unlanded work
+  may go (kit 37): a public origin with no private backup remote gets none. A remote that cannot be asked prints one
+  note and the start goes on.
+- **`status --all` shows what every clone holds on the remote.** One fetch of the hidden refs (`refs/wip/*` and
+  `refs/claims/*`) into `refs/session-seen/` in this clone, then local reads. For each task: `CLAIMED` (started,
+  nothing saved yet) or `BACKED UP`, its holder (the author of the backup's tip, or of the claim; the person slug when
+  the task record, the claim or the branch name carries one), the age of that commit, how many commits it is ahead of
+  and behind main, how many files it changes, its objective when the record is in the backup, and whether it is this
+  clone's own. Other clones' work is listed first. Nothing is pushed and no branch or worktree changes; the copy under
+  `refs/session-seen/` is pruned to what the remote holds on each call. `--json` adds a `remote` key. When the remote
+  cannot be asked the view says `NOT CHECKED` and lists nothing. A holder is the name on a commit: supplied, not
+  verified.
+- **`resume` continues another clone's task as a new attempt.** `session resume <task>` finds the task on the remote by
+  its backup ref, branch, task id or bare task name (more than one match is listed, never guessed). It cuts a new
+  branch from the backed-up tip, so the earlier commits are in it unchanged with their authors, under this clone's own
+  names: task `<task>-cont` unless `--as` gives another, its own worktree, claim and backup ref. The new task record
+  has a `continues` field (the earlier task id, branch, backup ref, the commit read, its holder and date), and the new
+  handoff says the same and quotes the earlier handoff, so the resumer need not ask the first owner anything. The
+  earlier attempt's refs are only read. Its own record and handoff file are taken out of the new branch in the resume
+  commit, because two live records owning the same paths fail the audit; they stay in the earlier attempt's commits.
+  The first owner's later commits keep going to their own ref. A task with only a claim, or with nothing ahead of main,
+  has nothing to continue and `resume` says so. The landing of the new attempt names the earlier author in a
+  `Co-authored-by:` trailer (kit 39).
+- **A land that conflicts with another person's landing is refused, and the two owners decide.** When the rebase stops
+  on lines a landing by someone else changed (an author whose email and name both differ from this clone's), `land`
+  names that landing's author, commit, date and branch, undoes the rebase so the branch is as it was, and exits 3. It
+  tells no one to resolve it: two owners' intents cannot both hold, and no agent chooses between them. The task record
+  is reopened as `blocked`, never left reading complete, with a `land_refused` field naming the landing and the files,
+  and the branch is backed up at once, so `status` here and `status --all` in the other owner's clone both show
+  `LAND REFUSED` and whom it is against. When the owners have decided, `land --owners-decided "<who decided, and
+  what>"` writes the decision into the record (`conflict_decision`) and stops at the same lines with the rebase open,
+  to apply that decision and nothing else; `git rebase --continue` and the same `land` again then land it. A conflict
+  between one person's own sessions keeps the earlier path: the rebase stays open and is resolved by meaning.
+
+What this does not do: tell the first owner at the moment a second landing is refused against theirs (they see it
+when they next run `status --all`), flag two changes that merge cleanly but aim at goals that cannot both hold, or
+reserve a landing. A person is still a name a clone supplies; nothing here verifies it.
 
 ## What the hooks enforce
 
