@@ -832,6 +832,30 @@ def manifest_section(c):
     return "\n".join(lines)
 
 
+def append_rows(cur, rows, date):
+    """The ledger's bytes with `rows` added at the end of its table (the table and the file made when absent)."""
+    doc = cur.decode("utf-8", "surrogateescape") if cur else LEDGER_HEAD.format(date=date)
+    if not doc.endswith("\n"):
+        doc += "\n"
+    last = next((l for l in reversed(doc.splitlines()) if l.strip()), "")
+    if not last.startswith("|"):
+        doc += ("\n" if doc.strip() and not doc.endswith("\n\n") else "") + TABLE_HEAD
+    return (doc + "\n".join(rows) + "\n").encode("utf-8", "surrogateescape")
+
+
+NOT_FINISHED = "NOT FINISHED"
+
+
+def ledger_note(repo, base, date, name, tag, tip, text, manifest=""):
+    """One more ledger row about a retirement already recorded (kit 42): that it stopped with the worktree still
+    there, or that a later run finished it. The ledger is only ever added to, so the row that said "retired" too
+    early is corrected by the row after it, never rewritten."""
+    cell = " ".join(str(text).split()).replace("|", "/")
+    row = f"| {date} | {name} | worktree | tag `{tag}` | {tip[:8]} | | | | {cell} | {manifest} |"
+    return land_record(repo, base, {LEDGER: lambda cur: append_rows(cur, [row], date)},
+                       f"retire: {name}: {cell[:60]}")
+
+
 def build_record(primary, base, cands, date, stamp, source="worktree-reaper", intro=None):
     """{repo-relative path: function(origin's bytes or None) -> new bytes} for the one record commit."""
     name = f"RET-{date}-{source}-{stamp}.md"
@@ -852,15 +876,7 @@ def build_record(primary, base, cands, date, stamp, source="worktree-reaper", in
                     f"{c['wt']['head'][:8]} | {c['info']['last']} | {len(c['info']['commits'])} | "
                     f"{len(c['info']['files'])} | {why}. | [{name}]({name}) |")
 
-    def ledger(cur):
-        doc = cur.decode("utf-8", "surrogateescape") if cur else LEDGER_HEAD.format(date=date)
-        if not doc.endswith("\n"):
-            doc += "\n"
-        last = next((l for l in reversed(doc.splitlines()) if l.strip()), "")
-        if not last.startswith("|"):
-            doc += ("\n" if doc.strip() and not doc.endswith("\n\n") else "") + TABLE_HEAD
-        return (doc + "\n".join(rows) + "\n").encode("utf-8", "surrogateescape")
-    files[LEDGER] = ledger
+    files[LEDGER] = lambda cur: append_rows(cur, rows, date)
     any_residue = False
     for c in cands:
         wt, folder = c["wt"]["path"], f"{RESIDUE}/{c['wt']['path'].name}"
@@ -1027,7 +1043,7 @@ def ignored_plan(primary, wt):
     Until kit 31 every different copy was work, and the copy kept in place was whichever was in the primary, so a
     newer build could end up archived while an older one stayed live (an engagement repo, 2026-10-23: 153 files)."""
     res = {"carry": [], "dup": [], "replace": [], "aside": [], "dropped": 0, "work": []}
-    budget = 0
+    budget, planned = 0, set()
     for rel in ignored(wt):
         if dropping(rel):
             res["dropped"] += 1
@@ -1036,6 +1052,9 @@ def ignored_plan(primary, wt):
             if dropping(f):
                 res["dropped"] += 1
                 continue
+            if f in planned:  # kit 42: a path git lists twice is planned once
+                continue
+            planned.add(f)
             mine, theirs = Path(wt) / f, Path(primary) / f
             if not os.path.lexists(theirs):
                 res["carry"].append(f)
@@ -1151,12 +1170,27 @@ def keep_aside(primary, wt, replace, aside, rel):
     return placed
 
 
+def carry_conflicts(primary, wt, rels):
+    """The ignored files that can no longer simply move: the primary now holds a different copy at that path."""
+    out = []
+    for rel in dict.fromkeys(rels):
+        src, dest = Path(wt) / rel, Path(primary) / rel
+        if os.path.lexists(src) and os.path.lexists(dest) and not same_file(src, dest):
+            out.append(rel)
+    return out
+
+
 def carry_ignored(primary, wt, rels):
     """Move each ignored file to the same path in the primary. Returns how many moved; raises RuntimeError when the
-    primary has since gained a different copy (both kept, the worktree left)."""
+    primary has since gained a different copy (both kept, the worktree left). A path named twice moves once, and a
+    file already moved by an earlier run (gone from the worktree, present in the primary) is passed over (kit 42:
+    until then the second mention found no source, read that as "a different copy", and stopped the retirement
+    after its ledger row had landed)."""
     moved = 0
-    for rel in rels:
+    for rel in dict.fromkeys(rels):
         src, dest = Path(wt) / rel, Path(primary) / rel
+        if not os.path.lexists(src) and os.path.lexists(dest):
+            continue
         if os.path.lexists(dest):
             if not same_file(src, dest):
                 raise RuntimeError(f"{rel}: the primary now has a different copy; both kept, worktree left")
@@ -1273,6 +1307,8 @@ def mark_task_retired(wt, branch, reason, when):
         except (OSError, ValueError):
             continue
         if isinstance(rec, dict) and rec.get("branch") == branch:
+            if rec.get("status") == "retired":  # kit 42: a second run changes nothing, so its tag is the first run's
+                return str(p.relative_to(wt))
             rec.update(status="retired", retired=when, retired_reason=reason)
             p.write_text(json.dumps(rec, indent=2) + "\n")
             return str(p.relative_to(wt))
@@ -1377,6 +1413,7 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
                              "private origin was found to hold its ledger row and manifest; nothing was changed")
             return rec
     os.environ["SESSION_WIP_BACKUP"] = "0"  # this process's own commits push no backup ref
+    note = {}  # where the ledger row went, once it has (kit 42)
     when = datetime.fromtimestamp(now) if now else datetime.now()
     date = when.strftime("%Y-%m-%d")
     try:
@@ -1405,6 +1442,13 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
                     + (f"; {len(rec['snapshot'])} uncommitted path(s) in its snapshot" if rec["snapshot"] else "")}
         stamp = when.strftime("%H%M")
         message = (f"retire: {wt.name}, work not on main, kept on {tag}\n\n{reason or 'retired by hand'}")
+        # kit 42: the last look before the record lands. Until then the record landed first and the file moves after
+        # it could still stop, so main's ledger said "retired" for a worktree that was still there (2026-11-20).
+        clash = carry_conflicts(primary, wt, plan["carry"])
+        if clash:
+            raise RuntimeError(f"{clash[0]}" + (f" and {len(clash) - 1} more" if len(clash) > 1 else "")
+                               + ": the primary gained a different copy while this ran; no ledger row was written, "
+                               f"the tag {tag} holds the tip, and the worktree is left. Run retire again")
         if archived or withheld:
             ws = Path(root) if root else workspaces_root(primary)
             if ws is None or os.path.realpath(ws) == os.path.realpath(primary):
@@ -1422,11 +1466,19 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
                               + ("on the private backup remote" if dest else "only in this machine's clone, not "
                                  "remotely durable") + ", and this record is kept in the Workspaces root)")
             c["name"] = f"{Path(rel).name}/{wt.name}"
-            route, ref = land_record(ws, default_branch(ws), build_record(ws, default_branch(ws), [c], date, stamp,
-                                                                           source=source, intro=RETIRE_INTRO), message)
+            led = (ws, default_branch(ws))
         else:
-            route, ref = land_record(primary, base, build_record(primary, base, [c], date, stamp, source=source,
-                                                                 intro=RETIRE_INTRO), message)
+            led = (primary, base)
+        note.update(repo=led[0], base=led[1], date=date, name=c.get("name") or wt.name, tag=tag, tip=head)
+        git(led[0], "fetch", "-q", "origin", led[1])
+        if recorded(led[0], led[1], tag):  # an earlier run recorded this tag and stopped: one record, not two
+            route, ref, note["again"] = "already-recorded", "", True
+        else:
+            mname = f"RET-{date}-{source}-{stamp}.md"
+            route, ref = land_record(led[0], led[1], build_record(led[0], led[1], [c], date, stamp, source=source,
+                                                                  intro=RETIRE_INTRO), message)
+            note["manifest"] = f"[{mname}]({mname})"
+        note["landed"] = True
         rec.update(route=route, record=ref)
         rec["newer_placed"] = keep_aside(primary, wt, plan["replace"], plan["aside"], aside_rel) if aside_rel else 0
         rec["kept_aside"] = aside_rel or ""
@@ -1435,6 +1487,24 @@ def retire(primary, wt, *, base=None, reason="", source="session-retire", kind="
         rec["wip_dropped"] = False if archived or withheld else drop_wip(primary, branch, tips=(head,))
         rec["action"] = "retired"
         rec["reason"] = reason or "retired by hand"
+        if note.get("again"):
+            try:
+                ledger_note(note["repo"], note["base"], date, note["name"], tag, head,
+                            "Finished: the worktree was removed by a later run of retire.")
+            except (RuntimeError, OSError):
+                pass  # the worktree is gone and the tag holds it; the next reader sees the removal in git itself
     except (RuntimeError, OSError) as e:
         rec["action"], rec["reason"] = "error", str(e)[:400]
+        if note.get("landed") and wt.is_dir():
+            # kit 42: the record is on main and the worktree is still here. Say so in the ledger and to the caller.
+            rec["record_landed"] = True
+            said = "a second ledger row says so"
+            try:
+                ledger_note(note["repo"], note["base"], note["date"], note["name"], note["tag"], note["tip"],
+                            f"{NOT_FINISHED}: {str(e)[:200]}. The worktree is still at {tilde(wt)}; the tag holds "
+                            "its tip. Run retire again to finish.", note.get("manifest", ""))
+            except (RuntimeError, OSError) as e2:
+                said = f"the row correcting it could not be written ({str(e2)[:120]})"
+            rec["reason"] += (f"; its ledger row had already landed and reads as retired, {said}; the worktree is "
+                              "still here, and running retire again finishes it without a second record")
     return rec

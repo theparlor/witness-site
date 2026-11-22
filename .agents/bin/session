@@ -411,6 +411,30 @@ def session_id():
             or os.environ.get("CLAUDE_SESSION_ID") or None)
 
 
+def session_pid():
+    """The process of the session running this command, when its harness says (kit 42): Claude Code sets CLAUDE_PID;
+    SESSION_KIT_SESSION_PID goes with SESSION_KIT_SESSION_ID for any other harness (and the tests). None when
+    unknown, and then no worktree is ever judged live on its account."""
+    raw = (os.environ.get("SESSION_KIT_SESSION_PID") if os.environ.get("SESSION_KIT_SESSION_ID")
+           else os.environ.get("CLAUDE_PID"))
+    try:
+        return int(raw) if raw and int(raw) > 1 else None
+    except ValueError:
+        return None
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, TypeError, ValueError, OverflowError):
+        return False
+    return True
+
+
 def pin_path(top):
     """This worktree's own git dir, which no checkout, rebase or clean reaches (as kept_dir)."""
     return Path(git(top, "rev-parse", "--path-format=absolute", "--git-dir", env=READ_ONLY)) / PIN_FILE
@@ -423,8 +447,8 @@ def read_pin(top):
         return None
 
 
-def write_pin(top, branch, task=None, sid=None):
-    pin = {"branch": branch, "task": task, "session": sid,
+def write_pin(top, branch, task=None, sid=None, pid=None):
+    pin = {"branch": branch, "task": task, "session": sid, "pid": pid,
            "pinned": dt.datetime.now().astimezone().isoformat(timespec="seconds")}
     p = pin_path(top)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -434,6 +458,51 @@ def write_pin(top, branch, task=None, sid=None):
 
 def short_id(sid):
     return (sid or "unknown")[:8]
+
+
+def keep_pin_current(top, pin):
+    """The owning session's own process on its pin (kit 42): a session that was resumed runs as a new process, and
+    the pin follows it the next time that session commits or runs a kit verb here. Never raises."""
+    try:
+        pid = session_pid()
+        if pin and pid and pin.get("session") and pin["session"] == session_id() and pin.get("pid") != pid:
+            write_pin(top, pin.get("branch"), pin.get("task"), pin["session"], pid)
+    except (OSError, SystemExit):
+        pass
+
+
+def live_owner(wt):
+    """The pin of `wt` when another session owns it and that session's process is still running, else None.
+
+    Kit 28 stops a second session's commit and lets a land by another session through as a hand-off, because the
+    lane it lands is gone. On 2026-11-20 the lane was not gone: two sessions on one machine closed, landed and
+    retired the same three batch worktrees at once, and one staged the other's half-merged lists. The pin now
+    carries the owner's process, and land, finish and retire by any other session are refused while it runs.
+    Not judged: a pin with no process on it (made before kit 42, or by a harness that names none), a caller with
+    no session identity (a person's terminal, the hourly sweep), and SESSION_ALLOW_SHARED_WORKTREE=1."""
+    pin, sid = read_pin(Path(wt)), session_id()
+    if not pin or not pin.get("session") or not sid:
+        return None
+    if pin["session"] == sid:
+        keep_pin_current(wt, pin)
+        return None
+    pid = pin.get("pid")
+    if os.environ.get(ALLOW_SHARED) == "1" or not isinstance(pid, int) or pid == session_pid():
+        return None
+    return pin if pid_alive(pid) else None
+
+
+def refuse_live_owner(wt, verb):
+    pin = live_owner(wt)
+    if not pin:
+        return
+    EVENT["attrs"]["reason"] = "live_owner"
+    sys.exit(f"session: REFUSED: {verb} of {Path(wt).name}: it belongs to session {short_id(pin['session'])} (task "
+             f"{pin.get('task') or 'unknown'}), and that session is still running on this machine (process "
+             f"{pin['pid']}). Two sessions closing one working tree stage each other's half-done files (2026-11-20, "
+             f"three batch worktrees). Nothing was changed.\n  Leave it to that session, or message it and let it "
+             f"{verb}.\n  If it has handed this worktree to you: {ALLOW_SHARED}=1 python3 .agents/bin/session {verb} "
+             f"... (reported to Witness)")
 
 
 def cmd_commit_guard(a):
@@ -469,7 +538,7 @@ def cmd_commit_guard(a):
     sid = session_id()
     if pin.get("branch") and pin["branch"] != branch:
         if os.environ.get(ALLOW_BRANCH) == "1":
-            write_pin(top, branch, pin.get("task"), pin.get("session"))
+            write_pin(top, branch, pin.get("task"), pin.get("session"), pin.get("pid"))
             EVENT["attrs"]["bypass"] = "branch_change"
             print(f"session: this worktree was pinned to {pin['branch']} and is now on {branch}; re-pinned under "
                   f"{ALLOW_BRANCH}=1, reported to Witness", file=sys.stderr)
@@ -485,7 +554,7 @@ def cmd_commit_guard(a):
         return 1
     if pin.get("session") and sid and pin["session"] != sid:
         if os.environ.get(ALLOW_SHARED) == "1":
-            write_pin(top, branch, pin.get("task"), sid)
+            write_pin(top, branch, pin.get("task"), sid, session_pid())
             EVENT["attrs"]["bypass"] = "shared_worktree"
             print(f"session: this worktree was started by session {short_id(pin['session'])} and session "
                   f"{short_id(sid)} is committing in it; re-pinned under {ALLOW_SHARED}=1, reported to Witness",
@@ -499,6 +568,7 @@ def cmd_commit_guard(a):
               f"  If that session is gone and this is its hand-off: {ALLOW_SHARED}=1 git commit ... (re-pins this "
               f"worktree to you, reported to Witness)", file=sys.stderr)
         return 1
+    keep_pin_current(top, pin)
     return 0
 
 
@@ -1210,7 +1280,7 @@ def cmd_start(a):
                 release_claim(primary, branch, claimed)
             raise
     activate_prepush(primary)
-    write_pin(wt, branch, tid, session_id())  # the commit guard holds this worktree to this branch and session (kit 28)
+    write_pin(wt, branch, tid, session_id(), session_pid())  # the commit guard holds this worktree to this branch and session (kit 28)
     try:  # kit 39: this clone's own-work log, so a later start of the same name here is known as this clone's
         load_retirement().own_note(primary, "start", branch=branch, task=tid)
     except (Exception, SystemExit):
@@ -1325,7 +1395,7 @@ def cmd_resume(a):
             release_claim(primary, branch, claimed)
         raise
     activate_prepush(primary)
-    write_pin(wt, branch, tid, session_id())
+    write_pin(wt, branch, tid, session_id(), session_pid())
     try:
         load_retirement().own_note(primary, "start", branch=branch, task=tid, continues=t["name"])
     except (Exception, SystemExit):
@@ -2430,6 +2500,7 @@ def cmd_land(a):
     top, primary, linked = here(a.here)
     if not linked:
         sys.exit("session: land runs inside a session worktree, not the primary checkout")
+    refuse_live_owner(top, "land")  # kit 42: a hand-off is for a lane that is gone, never one still running
     verdict = kf11_given_verdict(a)  # a malformed verdict refuses before anything changes (kit 34)
     os.environ[WIP_SWITCH] = "0"  # land's own commits (the close, a rebase's replays) push no backup ref
     base = default_branch(primary)
@@ -2639,6 +2710,7 @@ def cmd_finish(a):
     os.environ[WIP_SWITCH] = "0"
     base = default_branch(primary)
     wt = pick_worktree(primary, linked, top, a.task, "finish")
+    refuse_live_owner(wt, "finish")
     branch = git(wt, "branch", "--show-current")
     git(primary, "fetch", "-q", "--prune", "origin")
     st, pr_head = (run(["gh", "pr", "view", branch, *gh_repo(wt), "--json", "state,headRefOid", "-q",
@@ -2856,6 +2928,8 @@ def cmd_retire(a):
     top, primary, linked = here(a.here)
     os.environ[WIP_SWITCH] = "0"
     wt = pick_worktree(primary, linked, top, a.task, "retire")
+    if not a.dry_run:
+        refuse_live_owner(wt, "retire")
     rt = load_retirement()
     kind = "desktop" if "/.claude/worktrees/" in str(wt) else "kit"
     if not a.dry_run:
@@ -2880,6 +2954,8 @@ def cmd_retire(a):
                    + ("on the private backup remote" if rec.get("remote_durable") else
                       "kept LOCAL, on this machine only (not remotely durable)")
                    + "; ledger row in the Workspaces root") if rec.get("withheld")
+             else "tag pushed; ledger row already on main from the earlier run, and a row that says it finished"
+             if rec.get("route") == "already-recorded"
              else f"tag pushed; ledger row {'landed' if rec.get('route') == 'pushed' else 'in PR ' + str(rec.get('record'))}")
     print(f"retired {wt}\n  tag: {rec['tag']} ({where})\n  snapshot: {len(rec['snapshot'])} uncommitted path(s) "
           f"folded in\n  recover: git checkout -b {rec.get('branch') or '<branch>'} {rec['tag']}")
