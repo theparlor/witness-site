@@ -404,7 +404,15 @@ Each bypass is for one command, named in the refusal, and reported to Witness:
 `SESSION_ALLOW_PRIMARY_COMMIT=1`; `SESSION_ALLOW_BRANCH_CHANGE=1` (re-pins to the branch you are
 on); `SESSION_ALLOW_SHARED_WORKTREE=1` (re-pins the worktree to you: a hand-off from a session that
 is gone). `session land` run by a session other than the one that started the worktree treats its
-close commit as that hand-off, says so, and goes on. A worktree without a pin (made before kit 28,
+close commit as that hand-off, says so, and goes on. Since kit 42 the pin also carries the owning
+session's process (Claude Code's `CLAUDE_PID`; `SESSION_KIT_SESSION_PID` beside
+`SESSION_KIT_SESSION_ID` for any other harness), and `land`, `finish` and `retire` run by another
+session are refused, with nothing changed, while that process is still running: a hand-off is for a
+lane that is gone. A session that was resumed runs as a new process, and its pin follows it at its
+next commit or kit command there. `SESSION_ALLOW_SHARED_WORKTREE=1` passes the check for one
+command. Not judged: a pin with no process on it, and a caller with no session identity (a person's
+terminal, the hourly sweep). The kit sees its own commands and commits only: it cannot stop another
+session writing files into the folder. A worktree without a pin (made before kit 28,
 or by hand) commits as before. The guard fails open on its own errors and when python3 is missing;
 its Witness event (`org_design_tooling.session_kit`, verb `commit-guard`) carries the outcome, the
 reason or bypass, whether the checkout is linked and the staged count, never a path.
@@ -435,7 +443,10 @@ so only in a log nobody reads. Four changes:
   The snapshot is built with a temporary index, so no hook can leave it half staged; it never lands on
   main. Where GitHub has archived the origin (read-only), the tag stays local and the ledger row and
   manifest land in the Workspaces root's `.intent/retirements/` instead. The routine and record format
-  live in `.agents/bin/retirement.py`, shared with the reaper.
+  live in `.agents/bin/retirement.py`, shared with the reaper. Since kit 42 the record lands only
+  after a last look at the ignored files that are to move; when a later step still stops, a second
+  ledger row says NOT FINISHED and names where the worktree is, and running `retire` again finishes
+  it with no second manifest and a row that says it finished.
 - **Robot runs.** A scheduled job's session is a robot's when its task name (the branch's last segment
   without the `YYYY-MM-DD-` the kit adds) starts with a prefix listed in this repo's
   `.agents/repository-policy.json`, or when it was started with `session start <task> --robot`
